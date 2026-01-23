@@ -3,7 +3,7 @@
 An AI-powered CLI tool to log your work to **Jira** and **Notion** using natural language.
 
 ```bash
-python main.py log -p DF "2h on GBI-645 implementing Redis Sentinel"
+smart-log log -p DF "2h on GBI-645 implementing Redis Sentinel"
 ```
 
 **What happens:**
@@ -36,6 +36,45 @@ pip install -r requirements.txt
 
 # Install Playwright browser
 playwright install chromium
+```
+
+## Global Setup (Run from Anywhere)
+
+Install as a global command so you can run `smart-log` from any directory:
+
+```bash
+# From the project directory (with venv activated)
+pip install -e .
+```
+
+### Option 1: Use with venv activated
+
+```bash
+# Activate venv first, then run from anywhere
+source /path/to/smart-logger/venv/bin/activate
+smart-log log -p DF "2h on GBI-645 implementing feature"
+```
+
+### Option 2: Shell alias (recommended)
+
+Add to your `~/.zshrc` or `~/.bashrc`:
+
+```bash
+alias smart-log="/path/to/smart-logger/venv/bin/smart-log"
+```
+
+Then reload your shell:
+
+```bash
+source ~/.zshrc  # or ~/.bashrc
+```
+
+Now you can run from anywhere without activating venv:
+
+```bash
+smart-log log -p DF "2h on GBI-645 implementing feature"
+smart-log tasks "in progress"
+smart-log notion-status
 ```
 
 ## Configuration
@@ -84,48 +123,48 @@ NOTION_EMAIL=your@email.com
 
 ```bash
 # With project specified
-python main.py log -p DF "2h on GBI-645 implementing Redis Sentinel"
+smart-log log -p DF "2h on GBI-645 implementing Redis Sentinel"
 
 # Uses default project (NOTION_PROJECT_DEFAULT_NAME)
-python main.py log "30m on KFS-123 fixing bug"
+smart-log log "30m on KFS-123 fixing bug"
 
 # Meetings (auto-classified)
-python main.py log -p DF "1h team sync meeting"
+smart-log log -p DF "1h team sync meeting"
 
 # Documentation
-python main.py log -p DF "1h on GBI-645 writing API docs"
+smart-log log -p DF "1h on GBI-645 writing API docs"
 
 # No Jira ticket (Notion only)
-python main.py log -p DF "1h sprint planning session"
+smart-log log -p DF "1h sprint planning session"
 ```
 
 ### View Jira Tasks
 
 ```bash
 # Show all your tasks
-python main.py tasks
+smart-log tasks
 
 # Natural language queries
-python main.py tasks "in progress"
-python main.py tasks "high priority bugs"
-python main.py tasks "updated this week"
+smart-log tasks "in progress"
+smart-log tasks "high priority bugs"
+smart-log tasks "updated this week"
 
 # Filter by status
-python main.py tasks --status "In Progress"
-python main.py tasks -s "To Do" -n 10
+smart-log tasks --status "In Progress"
+smart-log tasks -s "To Do" -n 10
 ```
 
 ### Notion Authentication
 
 ```bash
 # Login to Notion (opens browser)
-python main.py notion-login
+smart-log notion-login
 
 # Check auth status
-python main.py notion-status
+smart-log notion-status
 
 # Logout (clear cached token)
-python main.py notion-logout
+smart-log notion-logout
 ```
 
 ## Task Type Classification
@@ -149,8 +188,10 @@ smart-logger/
 ├── main.py           # CLI commands and main logic
 ├── notion_auth.py    # Playwright-based Notion authentication
 ├── notion_form.py    # Notion form submission via internal API
+├── pyproject.toml    # Package config for global install
 ├── requirements.txt  # Python dependencies
-├── .env              # Configuration (not in git)
+├── .env.example      # Configuration template
+├── .env              # Your configuration (not in git)
 └── README.md
 ```
 
@@ -174,7 +215,7 @@ Instead of using the official Notion API (which requires integration access), th
 
 ### Token Expired
 ```bash
-python main.py notion-login
+smart-log notion-login
 ```
 
 ### Jira Connection Failed
@@ -184,7 +225,7 @@ python main.py notion-login
 ### Notion Form Submission Failed
 - Verify `NOTION_FORM_ID` and `NOTION_SPACE_ID`
 - Check project mapping (`NOTION_PROJECT_*`)
-- Run `notion-login` to refresh token
+- Run `smart-log notion-login` to refresh token
 
 ## License
 
