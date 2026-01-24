@@ -89,20 +89,42 @@ def ai_parse_task_query(natural_input: str) -> dict:
     - status: exact Jira status like "To Do", "In Progress", "Done", "Blocked"
     - priority: "Highest", "High", "Medium", "Low", "Lowest"
     - issue_type: "Bug", "Task", "Story", "Epic"
-    - project: project key like "PROJ"
+    - project: project key (e.g., "GBI", "KFS", "PROJ") - extract from phrases like "my GBI tasks", "GBI issues", "project GBI"
     - updated: relative time like "-1w" (last week), "-1d" (last day), "-1m" (last month)
     - created: relative time like "-1w", "-1d", "-1m"
     - text_search: keywords to search in summary/description
     
-    Return ONLY a JSON object with the filters found. Use null for filters not mentioned.
-    Example: {{"status": "In Progress", "priority": "High", "issue_type": null, "project": null, "updated": "-1w", "created": null, "text_search": null}}
+    IMPORTANT: Always return a valid JSON object, even if you can only extract partial information.
+    Use null for filters not mentioned. Never return explanatory text.
+    
+    Examples:
+    - "my GBI tasks" -> {{"project": "GBI", "status": null, "priority": null, "issue_type": null, "updated": null, "created": null, "text_search": null}}
+    - "in progress" -> {{"project": null, "status": "In Progress", "priority": null, "issue_type": null, "updated": null, "created": null, "text_search": null}}
+    - "high priority bugs" -> {{"project": null, "status": null, "priority": "High", "issue_type": "Bug", "updated": null, "created": null, "text_search": null}}
+    
+    Return ONLY a JSON object:
     """
     response = client.models.generate_content(
         model='gemini-2.0-flash',
         contents=prompt
     )
     clean_json = response.text.replace('```json', '').replace('```', '').strip()
-    return json.loads(clean_json)
+    
+    # Handle case where AI returns non-JSON
+    try:
+        return json.loads(clean_json)
+    except json.JSONDecodeError:
+        # If AI didn't return JSON, return empty filters
+        console.print(f"[yellow]⚠ AI response was not valid JSON, using default filters[/yellow]")
+        return {
+            "status": None,
+            "priority": None,
+            "issue_type": None,
+            "project": None,
+            "updated": None,
+            "created": None,
+            "text_search": natural_input  # Use the input as text search fallback
+        }
 
 
 def build_jql_from_filters(filters: dict) -> str:
