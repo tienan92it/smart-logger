@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import typer
 from rich.console import Console
@@ -11,16 +10,193 @@ from google import genai
 
 from notion_form import submit_notion_form, NotionFormError, NotionAuthError
 from notion_auth import get_notion_credentials, clear_token, load_stored_token
+from memory_bank import load_memory, save_memory, add_issue
+from ai_orchestrator import orchestrate, Intent, OrchestratorResult
 
 # Load Config
 load_dotenv()
 console = Console()
 app = typer.Typer()
 
-@app.callback()
-def main():
-    """Smart Logger - Log your work to Jira and Notion with AI."""
-    pass
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    input_text: Optional[str] = typer.Argument(None, help="Natural language input (e.g., '2h on GBI-123' or 'my tasks')"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Notion project name for logging"),
+):
+    """
+    Smart Logger - AI-powered work logging to Jira and Notion.
+    
+    Just describe what you want in natural language:
+    
+    Examples:
+        python main.py "2h on GBI-123 implementing feature"
+        python main.py "my tasks"
+        python main.py "show in progress bugs"
+        python main.py "what is GBI-123"
+    """
+    if ctx.invoked_subcommand is None and input_text:
+        # Smart mode - use AI orchestrator
+        _smart_handler(input_text, project)
+    elif ctx.invoked_subcommand is None:
+        # No input and no subcommand - show help
+        console.print(ctx.get_help())
+
+# --- SMART HANDLER ---
+
+def _smart_handler(input_text: str, project: Optional[str] = None):
+    """
+    Smart handler that uses AI orchestrator to route user input.
+    """
+    # Use default project from env if not specified
+    if not project:
+        project = os.getenv("NOTION_PROJECT_DEFAULT_NAME", "")
+    
+    def log_work_handler(log_data: dict) -> OrchestratorResult:
+        """Handle log_work intent."""
+        issue_key = log_data.get('key', '')
+        time_jira = log_data.get('time_jira', '')
+        time_hours = log_data.get('time_hours', 0)
+        description = log_data.get('desc', '')
+        task_type = log_data.get('task_type', 'Development')
+        
+        console.print(f"[green]Parsed:[/green] {issue_key or 'No ticket'} | {time_jira} ({time_hours}h) | {task_type} | {description}")
+        
+        # Try to log to Jira
+        issue_title = ""
+        jira_logged = False
+        
+        if is_valid_jira_key(issue_key):
+            try:
+                jira = get_jira_client()
+                issue = jira.issue(issue_key)
+                issue_title = issue.fields.summary
+                jira.add_worklog(issue=issue, timeSpent=time_jira, comment=description)
+                console.print(f"[bold green]Logged to Jira: {issue_key}[/bold green]")
+                jira_logged = True
+                
+                # Update memory with issue details
+                memory = load_memory()
+                memory = add_issue(memory, issue_key, issue_title)
+                save_memory(memory)
+                
+            except Exception as e:
+                console.print(f"[yellow]Jira skipped: {e}[/yellow]")
+        else:
+            console.print("[dim]No Jira ticket, skipping Jira.[/dim]")
+        
+        # Sync to Notion
+        try:
+            if jira_logged and issue_title:
+                proof_of_works = f"{issue_key}: {issue_title}"
+            elif is_valid_jira_key(issue_key):
+                proof_of_works = f"{issue_key}: {description}"
+            else:
+                proof_of_works = description
+            
+            submit_notion_form(
+                issue_key=issue_key if is_valid_jira_key(issue_key) else "",
+                description=proof_of_works,
+                time_hours=time_hours,
+                task_type=task_type,
+                project=project,
+            )
+            console.print("[bold green]Synced to Notion![/bold green]")
+            
+        except NotionAuthError as e:
+            console.print(f"[red]Notion Auth Error: {e}[/red]")
+            console.print("[yellow]Run 'python main.py notion-login' to re-authenticate.[/yellow]")
+            return OrchestratorResult(success=False, intent=Intent.LOG_WORK, message=str(e))
+        except NotionFormError as e:
+            console.print(f"[red]Notion Error: {e}[/red]")
+            return OrchestratorResult(success=False, intent=Intent.LOG_WORK, message=str(e))
+        
+        return OrchestratorResult(success=True, intent=Intent.LOG_WORK, message="Work logged successfully")
+    
+    def query_tasks_handler(filters: dict) -> OrchestratorResult:
+        """Handle query_tasks intent."""
+        try:
+            jira = get_jira_client()
+            jql = build_jql_from_filters(filters)
+            console.print(f"[dim]JQL: {jql}[/dim]")
+            
+            issues = jira.search_issues(jql, maxResults=20)
+            
+            if not issues:
+                console.print("[yellow]No tasks found.[/yellow]")
+                return OrchestratorResult(success=True, intent=Intent.QUERY_TASKS, message="No tasks found")
+            
+            # Build table
+            table = Table(title="My Jira Tasks", show_lines=True)
+            table.add_column("Key", style="cyan", no_wrap=True)
+            table.add_column("Summary", style="white")
+            table.add_column("Status", style="magenta")
+            table.add_column("Priority", style="yellow")
+            
+            for issue in issues:
+                priority = issue.fields.priority.name if issue.fields.priority else "-"
+                table.add_row(
+                    issue.key,
+                    issue.fields.summary[:60] + "..." if len(issue.fields.summary) > 60 else issue.fields.summary,
+                    str(issue.fields.status),
+                    priority
+                )
+            
+            console.print(table)
+            console.print(f"[dim]Showing {len(issues)} tasks[/dim]")
+            
+            return OrchestratorResult(success=True, intent=Intent.QUERY_TASKS, message=f"Found {len(issues)} tasks")
+            
+        except Exception as e:
+            console.print(f"[red]Jira Error: {e}[/red]")
+            return OrchestratorResult(success=False, intent=Intent.QUERY_TASKS, message=str(e))
+    
+    def task_detail_handler(issue_key: str) -> OrchestratorResult:
+        """Handle task_detail intent."""
+        try:
+            jira = get_jira_client()
+            issue = jira.issue(issue_key)
+            
+            # Update memory
+            memory = load_memory()
+            memory = add_issue(memory, issue_key, issue.fields.summary)
+            save_memory(memory)
+            
+            # Display details
+            console.print(f"\n[bold cyan]{issue.key}[/bold cyan]: {issue.fields.summary}")
+            console.print(f"[dim]Status:[/dim] {issue.fields.status}")
+            console.print(f"[dim]Priority:[/dim] {issue.fields.priority.name if issue.fields.priority else 'None'}")
+            console.print(f"[dim]Type:[/dim] {issue.fields.issuetype.name}")
+            
+            if issue.fields.description:
+                desc = issue.fields.description[:500]
+                if len(issue.fields.description) > 500:
+                    desc += "..."
+                console.print(f"\n[dim]Description:[/dim]\n{desc}")
+            
+            return OrchestratorResult(success=True, intent=Intent.TASK_DETAIL, message="Task details retrieved")
+            
+        except Exception as e:
+            console.print(f"[red]Jira Error: {e}[/red]")
+            return OrchestratorResult(success=False, intent=Intent.TASK_DETAIL, message=str(e))
+    
+    # Run orchestrator
+    result = orchestrate(
+        user_input=input_text,
+        log_work_handler=log_work_handler,
+        query_tasks_handler=query_tasks_handler,
+        task_detail_handler=task_detail_handler,
+    )
+    
+    # Handle clarify and help intents
+    if result.intent == Intent.HELP:
+        console.print(result.message)
+    elif result.intent == Intent.CLARIFY:
+        console.print(f"[yellow]{result.message}[/yellow]")
+    elif not result.success:
+        console.print(f"[red]Error: {result.message}[/red]")
+
 
 # --- SERVICES ---
 
@@ -32,21 +208,6 @@ def get_jira_client():
 
 def get_genai_client():
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-def extract_json_from_response(text: str) -> Optional[str]:
-    """
-    Try to extract JSON from AI response that might contain extra text.
-    """
-    # Clean up markdown code blocks
-    text = text.replace('```json', '').replace('```', '').strip()
-    
-    # Try to find JSON object in the text
-    json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-    if json_match:
-        return json_match.group()
-    
-    return text
-
 
 def ai_parse_log(natural_input: str):
     """
@@ -67,35 +228,37 @@ def ai_parse_log(natural_input: str):
     """
     
     prompt = f"""
-    You must respond with ONLY a JSON object, no other text.
-    
     Extract the following from this text: "{natural_input}"
-    1. Issue Key (e.g., PROJ-123, GBI-645, KFS-644) - use null if not found
+    1. Issue Key (e.g., PROJ-123, GBI-645, KFS-644)
     2. Time Spent in Jira format (like '2h', '30m', '1h 30m')
     3. Time as decimal hours (e.g., 2.0, 0.5, 1.5)
     4. Description (a clean summary of the work)
     5. Task type based on this guide:
     {task_type_guide}
     
-    Return ONLY this JSON format: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc": "...", "task_type": "..."}}
+    Return ONLY a JSON string: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc": "...", "task_type": "..."}}
     
     Examples:
     - "2h on GBI-645 implementing Redis" -> {{"key": "GBI-645", "time_jira": "2h", "time_hours": 2.0, "desc": "implementing Redis", "task_type": "Development"}}
-    - "1h meeting for sprint planning" -> {{"key": null, "time_jira": "1h", "time_hours": 1.0, "desc": "sprint planning", "task_type": "Meeting"}}
+    - "1h meeting for sprint planning" -> {{"key": "...", "time_jira": "1h", "time_hours": 1.0, "desc": "sprint planning", "task_type": "Meeting"}}
+    - "30m writing API docs for GBI-123" -> {{"key": "GBI-123", "time_jira": "30m", "time_hours": 0.5, "desc": "writing API docs", "task_type": "Documentation"}}
+    - "1h researching Redis Sentinel" -> {{"key": "...", "time_jira": "1h", "time_hours": 1.0, "desc": "researching Redis Sentinel", "task_type": "Research"}}
     """
     response = client.models.generate_content(
-        model='gemini-2.0-flash',
+        model='gemini-2.0-flash',  # Fast & Free tier eligible
         contents=prompt
     )
+    # Simple cleanup to ensure we get just the JSON
+    clean_json = response.text.replace('```json', '').replace('```', '').strip()
     
-    # Try to extract and parse JSON
-    clean_json = extract_json_from_response(response.text)
     try:
         return json.loads(clean_json)
     except json.JSONDecodeError:
-        console.print(f"[yellow]⚠ AI returned invalid JSON, please try again[/yellow]")
-        console.print(f"[dim]Response was: {response.text[:200]}...[/dim]")
-        raise typer.Exit(1)
+        raise ValueError(
+            f"Could not parse work log from input. AI response: {clean_json[:200]}...\n"
+            "Hint: Work log entries should include time spent (e.g., '2h on GBI-123 fixing bugs').\n"
+            "To list your tasks, use: python main.py tasks"
+        )
 
 
 def ai_parse_task_query(natural_input: str) -> dict:
@@ -105,49 +268,26 @@ def ai_parse_task_query(natural_input: str) -> dict:
     client = get_genai_client()
     
     prompt = f"""
-    You must respond with ONLY a JSON object, no other text.
-    
     Convert this natural language request into Jira JQL filter components: "{natural_input}"
     
     Extract any of these filters if mentioned:
-    - project: project key (e.g., "GBI", "KFS", "PROJ") - extract from phrases like "my GBI tasks", "GBI issues", "GBI"
     - status: exact Jira status like "To Do", "In Progress", "Done", "Blocked"
     - priority: "Highest", "High", "Medium", "Low", "Lowest"
     - issue_type: "Bug", "Task", "Story", "Epic"
+    - project: project key like "PROJ"
     - updated: relative time like "-1w" (last week), "-1d" (last day), "-1m" (last month)
     - created: relative time like "-1w", "-1d", "-1m"
     - text_search: keywords to search in summary/description
     
-    Use null for filters not mentioned.
-    
-    Examples:
-    - "my GBI tasks" -> {{"project": "GBI", "status": null, "priority": null, "issue_type": null, "updated": null, "created": null, "text_search": null}}
-    - "in progress" -> {{"project": null, "status": "In Progress", "priority": null, "issue_type": null, "updated": null, "created": null, "text_search": null}}
-    - "GBI bugs" -> {{"project": "GBI", "status": null, "priority": null, "issue_type": "Bug", "updated": null, "created": null, "text_search": null}}
-    
-    Return ONLY the JSON object:
+    Return ONLY a JSON object with the filters found. Use null for filters not mentioned.
+    Example: {{"status": "In Progress", "priority": "High", "issue_type": null, "project": null, "updated": "-1w", "created": null, "text_search": null}}
     """
     response = client.models.generate_content(
         model='gemini-2.0-flash',
         contents=prompt
     )
-    
-    # Try to extract and parse JSON
-    clean_json = extract_json_from_response(response.text)
-    try:
-        return json.loads(clean_json)
-    except json.JSONDecodeError:
-        # If AI didn't return JSON, return empty filters with text search fallback
-        console.print(f"[yellow]⚠ AI response was not valid JSON, using text search[/yellow]")
-        return {
-            "status": None,
-            "priority": None,
-            "issue_type": None,
-            "project": None,
-            "updated": None,
-            "created": None,
-            "text_search": natural_input
-        }
+    clean_json = response.text.replace('```json', '').replace('```', '').strip()
+    return json.loads(clean_json)
 
 
 def build_jql_from_filters(filters: dict) -> str:
@@ -205,10 +345,15 @@ def log(
         project = os.getenv("NOTION_PROJECT_DEFAULT_NAME", "")
         if project:
             console.print(f"[dim]Using default project: {project}[/dim]")
-    console.print(f"[bold blue]🤖 AI Agent is parsing:[/bold blue] '{task}'...")
+    
+    console.print(f"[bold blue]AI parsing:[/bold blue] '{task}'...")
     
     # 1. AI Parsing
-    parsed_data = ai_parse_log(task)
+    try:
+        parsed_data = ai_parse_log(task)
+    except ValueError as e:
+        console.print(f"[red]❌ Parse Error: {e}[/red]")
+        raise typer.Exit(1)
     issue_key = parsed_data.get('key', '')
     time_jira = parsed_data['time_jira']
     time_hours = parsed_data['time_hours']
@@ -228,10 +373,16 @@ def log(
             issue = jira.issue(issue_key)
             issue_title = issue.fields.summary  # Get the actual ticket title
             jira.add_worklog(issue=issue, timeSpent=time_jira, comment=description)
-            console.print(f"[bold green]✔ Logged to Jira: {issue_key}[/bold green]")
+            console.print(f"[bold green]Logged to Jira: {issue_key}[/bold green]")
             jira_logged = True
+            
+            # Save to memory for future context
+            memory = load_memory()
+            memory = add_issue(memory, issue_key, issue_title)
+            save_memory(memory)
+            
         except Exception as e:
-            console.print(f"[yellow]⚠ Jira skipped: {e}[/yellow]")
+            console.print(f"[yellow]Jira skipped: {e}[/yellow]")
             console.print("[dim]Will continue to log to Notion only.[/dim]")
     else:
         console.print("[dim]No Jira ticket found, skipping Jira.[/dim]")

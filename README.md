@@ -3,17 +3,22 @@
 An AI-powered CLI tool to log your work to **Jira** and **Notion** using natural language.
 
 ```bash
-smart-log log -p DF "2h on GBI-645 implementing Redis Sentinel"
+# Smart mode - AI figures out what you want
+smart-log "2h on GBI-645 implementing Redis Sentinel"
+smart-log "my tasks"
+smart-log "show in progress bugs"
 ```
 
 **What happens:**
-1. 🤖 AI parses your natural language input
-2. ✅ Logs worklog to Jira (if valid ticket)
-3. ✅ Submits to Notion form (with auto-classified task type)
+1. 🤖 AI classifies your intent (log work, query tasks, get details, etc.)
+2. 🧠 Context from memory enhances AI understanding
+3. ✅ Automatically routes to the right action
 
 ## Features
 
-- **Natural Language Parsing** - Just describe your work, AI extracts ticket, time, and description
+- **Smart Intent Detection** - Just describe what you want, AI routes to the right action
+- **Context-Aware Memory** - Learns your projects, issues, and patterns over time
+- **Natural Language Parsing** - AI extracts ticket, time, and description
 - **Smart Task Classification** - Auto-detects: Development, Design, Meeting, Documentation, Research, Planning
 - **Jira Integration** - Logs worklogs to Jira tickets
 - **Notion Form Submission** - Submits to Notion via internal form API (no integration setup needed)
@@ -119,39 +124,43 @@ NOTION_EMAIL=your@email.com
 
 ## Usage
 
-### Log Work
+### Smart Mode (Recommended)
+
+Just describe what you want - AI figures out the rest:
 
 ```bash
-# With project specified
-smart-log log -p DF "2h on GBI-645 implementing Redis Sentinel"
+# Log work (AI detects time indicator)
+smart-log "2h on GBI-645 implementing Redis Sentinel"
+smart-log "30m team standup meeting"
+smart-log "1h reviewing PRs"
 
-# Uses default project (NOTION_PROJECT_DEFAULT_NAME)
-smart-log log "30m on KFS-123 fixing bug"
+# Query tasks (AI detects query intent)
+smart-log "my tasks"
+smart-log "show in progress bugs"
+smart-log "my GBI issues"
+smart-log "high priority tasks"
 
-# Meetings (auto-classified)
-smart-log log -p DF "1h team sync meeting"
+# Task details
+smart-log "what is GBI-123"
+smart-log "details on KFS-456"
 
-# Documentation
-smart-log log -p DF "1h on GBI-645 writing API docs"
-
-# No Jira ticket (Notion only)
-smart-log log -p DF "1h sprint planning session"
+# Help
+smart-log "help"
 ```
 
-### View Jira Tasks
+### Explicit Commands
+
+You can also use explicit commands if you prefer:
 
 ```bash
-# Show all your tasks
+# Log work explicitly
+smart-log log -p DF "2h on GBI-645 implementing Redis Sentinel"
+smart-log log "30m on KFS-123 fixing bug"
+
+# Query tasks explicitly
 smart-log tasks
-
-# Natural language queries
 smart-log tasks "in progress"
-smart-log tasks "high priority bugs"
-smart-log tasks "updated this week"
-
-# Filter by status
-smart-log tasks --status "In Progress"
-smart-log tasks -s "To Do" -n 10
+smart-log tasks --status "In Progress" -n 10
 ```
 
 ### Notion Authentication
@@ -185,15 +194,27 @@ The AI automatically classifies your work into these categories:
 
 ```
 smart-logger/
-├── main.py           # CLI commands and main logic
-├── notion_auth.py    # Playwright-based Notion authentication
-├── notion_form.py    # Notion form submission via internal API
-├── pyproject.toml    # Package config for global install
-├── requirements.txt  # Python dependencies
-├── .env.example      # Configuration template
-├── .env              # Your configuration (not in git)
+├── main.py             # CLI commands and smart handler
+├── ai_orchestrator.py  # AI intent classification and routing
+├── memory_bank.py      # Persistent context/memory storage
+├── notion_auth.py      # Playwright-based Notion authentication
+├── notion_form.py      # Notion form submission via internal API
+├── pyproject.toml      # Package config for global install
+├── requirements.txt    # Python dependencies
+├── .env.example        # Configuration template
+├── .env                # Your configuration (not in git)
 └── README.md
 ```
+
+### Memory Bank
+
+The tool stores context in `~/.smart-logger/memory.json`:
+- Recent issues you've worked on
+- Auto-learned project codes
+- Query history
+- Usage stats
+
+This context is injected into AI prompts to make responses smarter over time.
 
 ## How It Works
 

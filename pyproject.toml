@@ -22,4 +22,4 @@ dependencies = [
 smart-log = "main:app"
 
 [tool.setuptools]
-py-modules = ["main", "notion_auth", "notion_form"]
+py-modules = ["main", "notion_auth", "notion_form", "memory_bank", "ai_orchestrator"]
