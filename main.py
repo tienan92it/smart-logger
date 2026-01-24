@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import typer
 from rich.console import Console
@@ -32,6 +33,21 @@ def get_jira_client():
 def get_genai_client():
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+def extract_json_from_response(text: str) -> Optional[str]:
+    """
+    Try to extract JSON from AI response that might contain extra text.
+    """
+    # Clean up markdown code blocks
+    text = text.replace('```json', '').replace('```', '').strip()
+    
+    # Try to find JSON object in the text
+    json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if json_match:
+        return json_match.group()
+    
+    return text
+
+
 def ai_parse_log(natural_input: str):
     """
     Uses AI to convert natural language into structured data.
@@ -51,29 +67,35 @@ def ai_parse_log(natural_input: str):
     """
     
     prompt = f"""
+    You must respond with ONLY a JSON object, no other text.
+    
     Extract the following from this text: "{natural_input}"
-    1. Issue Key (e.g., PROJ-123, GBI-645, KFS-644)
+    1. Issue Key (e.g., PROJ-123, GBI-645, KFS-644) - use null if not found
     2. Time Spent in Jira format (like '2h', '30m', '1h 30m')
     3. Time as decimal hours (e.g., 2.0, 0.5, 1.5)
     4. Description (a clean summary of the work)
     5. Task type based on this guide:
     {task_type_guide}
     
-    Return ONLY a JSON string: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc": "...", "task_type": "..."}}
+    Return ONLY this JSON format: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc": "...", "task_type": "..."}}
     
     Examples:
     - "2h on GBI-645 implementing Redis" -> {{"key": "GBI-645", "time_jira": "2h", "time_hours": 2.0, "desc": "implementing Redis", "task_type": "Development"}}
-    - "1h meeting for sprint planning" -> {{"key": "...", "time_jira": "1h", "time_hours": 1.0, "desc": "sprint planning", "task_type": "Meeting"}}
-    - "30m writing API docs for GBI-123" -> {{"key": "GBI-123", "time_jira": "30m", "time_hours": 0.5, "desc": "writing API docs", "task_type": "Documentation"}}
-    - "1h researching Redis Sentinel" -> {{"key": "...", "time_jira": "1h", "time_hours": 1.0, "desc": "researching Redis Sentinel", "task_type": "Research"}}
+    - "1h meeting for sprint planning" -> {{"key": null, "time_jira": "1h", "time_hours": 1.0, "desc": "sprint planning", "task_type": "Meeting"}}
     """
     response = client.models.generate_content(
-        model='gemini-2.0-flash',  # Fast & Free tier eligible
+        model='gemini-2.0-flash',
         contents=prompt
     )
-    # Simple cleanup to ensure we get just the JSON
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
-    return json.loads(clean_json)
+    
+    # Try to extract and parse JSON
+    clean_json = extract_json_from_response(response.text)
+    try:
+        return json.loads(clean_json)
+    except json.JSONDecodeError:
+        console.print(f"[yellow]⚠ AI returned invalid JSON, please try again[/yellow]")
+        console.print(f"[dim]Response was: {response.text[:200]}...[/dim]")
+        raise typer.Exit(1)
 
 
 def ai_parse_task_query(natural_input: str) -> dict:
@@ -83,39 +105,40 @@ def ai_parse_task_query(natural_input: str) -> dict:
     client = get_genai_client()
     
     prompt = f"""
+    You must respond with ONLY a JSON object, no other text.
+    
     Convert this natural language request into Jira JQL filter components: "{natural_input}"
     
     Extract any of these filters if mentioned:
+    - project: project key (e.g., "GBI", "KFS", "PROJ") - extract from phrases like "my GBI tasks", "GBI issues", "GBI"
     - status: exact Jira status like "To Do", "In Progress", "Done", "Blocked"
     - priority: "Highest", "High", "Medium", "Low", "Lowest"
     - issue_type: "Bug", "Task", "Story", "Epic"
-    - project: project key (e.g., "GBI", "KFS", "PROJ") - extract from phrases like "my GBI tasks", "GBI issues", "project GBI"
     - updated: relative time like "-1w" (last week), "-1d" (last day), "-1m" (last month)
     - created: relative time like "-1w", "-1d", "-1m"
     - text_search: keywords to search in summary/description
     
-    IMPORTANT: Always return a valid JSON object, even if you can only extract partial information.
-    Use null for filters not mentioned. Never return explanatory text.
+    Use null for filters not mentioned.
     
     Examples:
     - "my GBI tasks" -> {{"project": "GBI", "status": null, "priority": null, "issue_type": null, "updated": null, "created": null, "text_search": null}}
     - "in progress" -> {{"project": null, "status": "In Progress", "priority": null, "issue_type": null, "updated": null, "created": null, "text_search": null}}
-    - "high priority bugs" -> {{"project": null, "status": null, "priority": "High", "issue_type": "Bug", "updated": null, "created": null, "text_search": null}}
+    - "GBI bugs" -> {{"project": "GBI", "status": null, "priority": null, "issue_type": "Bug", "updated": null, "created": null, "text_search": null}}
     
-    Return ONLY a JSON object:
+    Return ONLY the JSON object:
     """
     response = client.models.generate_content(
         model='gemini-2.0-flash',
         contents=prompt
     )
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
     
-    # Handle case where AI returns non-JSON
+    # Try to extract and parse JSON
+    clean_json = extract_json_from_response(response.text)
     try:
         return json.loads(clean_json)
     except json.JSONDecodeError:
-        # If AI didn't return JSON, return empty filters
-        console.print(f"[yellow]⚠ AI response was not valid JSON, using default filters[/yellow]")
+        # If AI didn't return JSON, return empty filters with text search fallback
+        console.print(f"[yellow]⚠ AI response was not valid JSON, using text search[/yellow]")
         return {
             "status": None,
             "priority": None,
@@ -123,7 +146,7 @@ def ai_parse_task_query(natural_input: str) -> dict:
             "project": None,
             "updated": None,
             "created": None,
-            "text_search": natural_input  # Use the input as text search fallback
+            "text_search": natural_input
         }
 
 
