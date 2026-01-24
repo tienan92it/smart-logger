@@ -243,16 +243,21 @@ Extract DISPLAY OPTIONS:
 - group_by: How to group results. Options: "project" (by ticket prefix like GBI, KFS), "status", "priority", "type", null (no grouping)
 - sort_by: How to sort. Options: "updated", "priority", "status", "key", null (default)
 - show_description: true if user wants to see descriptions, false otherwise
+- show_time_spent: true if user wants to see time logged/spent on tasks. Keywords: "time spent", "time logged", "hours", "how much time"
 
-IMPORTANT: If user says "group by project", "group by ticker", "group by prefix", "organize by project" -> set group_by to "project"
+IMPORTANT: 
+- If user says "group by project", "group by ticker", "group by prefix", "organize by project" -> set group_by to "project"
+- If user mentions "time", "hours", "time spent", "time logged", "how long" -> set show_time_spent to true
 
 Return ONLY JSON:
-{{"filters": {{"status": null, "priority": null, "issue_type": null, "project": null, "updated": null, "text_search": null}}, "display": {{"group_by": null, "sort_by": null, "show_description": false}}}}
+{{"filters": {{"status": null, "priority": null, "issue_type": null, "project": null, "updated": null, "text_search": null}}, "display": {{"group_by": null, "sort_by": null, "show_description": false, "show_time_spent": false}}}}
 
 Examples:
-- "my tasks grouped by project" -> {{"filters": {{}}, "display": {{"group_by": "project", "sort_by": null, "show_description": false}}}}
-- "show in progress tasks by priority" -> {{"filters": {{"status": "In Progress"}}, "display": {{"group_by": "priority", "sort_by": null, "show_description": false}}}}
-- "GBI tasks grouped by status" -> {{"filters": {{"project": "GBI"}}, "display": {{"group_by": "status", "sort_by": null, "show_description": false}}}}
+- "my tasks grouped by project" -> {{"filters": {{}}, "display": {{"group_by": "project", "sort_by": null, "show_description": false, "show_time_spent": false}}}}
+- "show in progress tasks by priority" -> {{"filters": {{"status": "In Progress"}}, "display": {{"group_by": "priority", "sort_by": null, "show_description": false, "show_time_spent": false}}}}
+- "GBI tasks grouped by status" -> {{"filters": {{"project": "GBI"}}, "display": {{"group_by": "status", "sort_by": null, "show_description": false, "show_time_spent": false}}}}
+- "show my tasks with time spent" -> {{"filters": {{}}, "display": {{"group_by": null, "sort_by": null, "show_description": false, "show_time_spent": true}}}}
+- "how much time on GBI tasks" -> {{"filters": {{"project": "GBI"}}, "display": {{"group_by": null, "sort_by": null, "show_description": false, "show_time_spent": true}}}}
 """
     
     response = client.models.generate_content(

@@ -21,33 +21,93 @@ app = typer.Typer()
 
 # --- DISPLAY HELPERS ---
 
-def _display_tasks_table(issues: list, show_desc: bool = False) -> None:
+def _format_time_spent(seconds: int) -> str:
+    """Format seconds into human-readable time (e.g., '2h 30m')."""
+    if not seconds or seconds == 0:
+        return "-"
+    
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    
+    if hours > 0 and minutes > 0:
+        return f"{hours}h {minutes}m"
+    elif hours > 0:
+        return f"{hours}h"
+    elif minutes > 0:
+        return f"{minutes}m"
+    return "-"
+
+
+def _get_time_spent_map(jira, issues: list) -> dict:
+    """Fetch time spent for multiple issues. Returns {issue_key: seconds}."""
+    time_map = {}
+    
+    console.print("[dim]Fetching time spent data...[/dim]")
+    
+    for issue in issues:
+        try:
+            # Get aggregated time spent from issue (faster than fetching worklogs)
+            time_spent = getattr(issue.fields, 'timespent', None) or 0
+            time_map[issue.key] = time_spent
+        except Exception:
+            time_map[issue.key] = 0
+    
+    return time_map
+
+
+def _display_tasks_table(issues: list, show_desc: bool = False, show_time: bool = False, jira=None) -> None:
     """Display tasks in a standard table format."""
+    time_map = {}
+    if show_time and jira:
+        time_map = _get_time_spent_map(jira, issues)
+    
     table = Table(title="My Jira Tasks", show_lines=True)
     table.add_column("Key", style="cyan", no_wrap=True)
     table.add_column("Summary", style="white")
     table.add_column("Status", style="magenta")
     table.add_column("Priority", style="yellow")
+    if show_time:
+        table.add_column("Time", style="green", justify="right")
     
+    total_seconds = 0
     for issue in issues:
         priority = issue.fields.priority.name if issue.fields.priority else "-"
         summary = issue.fields.summary
-        if len(summary) > 60 and not show_desc:
-            summary = summary[:60] + "..."
-        table.add_row(
+        if len(summary) > 55 and not show_desc:
+            summary = summary[:55] + "..."
+        
+        row = [
             issue.key,
             summary,
             str(issue.fields.status),
             priority
-        )
+        ]
+        
+        if show_time:
+            seconds = time_map.get(issue.key, 0)
+            total_seconds += seconds
+            row.append(_format_time_spent(seconds))
+        
+        table.add_row(*row)
     
     console.print(table)
-    console.print(f"[dim]Showing {len(issues)} tasks[/dim]")
+    
+    # Show totals
+    footer = f"[dim]Showing {len(issues)} tasks[/dim]"
+    if show_time and total_seconds > 0:
+        total_hours = total_seconds / 3600
+        footer += f" | [bold green]Total time: {_format_time_spent(total_seconds)} ({total_hours:.1f}h)[/bold green]"
+    console.print(footer)
 
 
-def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False) -> None:
+def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False, show_time: bool = False, jira=None) -> None:
     """Display tasks grouped by project, status, or priority."""
     from collections import defaultdict
+    
+    # Fetch time data if needed
+    time_map = {}
+    if show_time and jira:
+        time_map = _get_time_spent_map(jira, issues)
     
     # Group issues
     groups = defaultdict(list)
@@ -70,10 +130,26 @@ def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False)
     # Sort groups by count (descending)
     sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
     
+    # Calculate time per group if showing time
+    group_times = {}
+    total_seconds = 0
+    if show_time:
+        for group_name, group_issues in sorted_groups:
+            group_seconds = sum(time_map.get(issue.key, 0) for issue in group_issues)
+            group_times[group_name] = group_seconds
+            total_seconds += group_seconds
+    
     # Display summary header
     total = len(issues)
-    summary_parts = [f"[bold]{k}[/bold]: {len(v)}" for k, v in sorted_groups]
+    if show_time:
+        summary_parts = [f"[bold]{k}[/bold]: {len(v)} ({_format_time_spent(group_times.get(k, 0))})" for k, v in sorted_groups]
+    else:
+        summary_parts = [f"[bold]{k}[/bold]: {len(v)}" for k, v in sorted_groups]
+    
     console.print(f"\n[bold]Tasks by {group_by.title()}[/bold] ({total} total)")
+    if show_time and total_seconds > 0:
+        total_hours = total_seconds / 3600
+        console.print(f"  [bold green]Total time logged: {_format_time_spent(total_seconds)} ({total_hours:.1f}h)[/bold green]")
     console.print("  " + " | ".join(summary_parts))
     console.print()
     
@@ -98,8 +174,12 @@ def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False)
     # Display each group
     for group_name, group_issues in sorted_groups:
         # Create table for this group
+        group_time_str = ""
+        if show_time:
+            group_time_str = f" - {_format_time_spent(group_times.get(group_name, 0))}"
+        
         table = Table(
-            title=f"{group_name} ({len(group_issues)})",
+            title=f"{group_name} ({len(group_issues)}){group_time_str}",
             show_lines=False,
             title_style="bold cyan",
             border_style="dim",
@@ -108,6 +188,8 @@ def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False)
         table.add_column("Summary", style="white", ratio=3)
         table.add_column("Status", style="magenta", width=14)
         table.add_column("Priority", width=10)
+        if show_time:
+            table.add_column("Time", style="green", justify="right", width=10)
         
         for issue in group_issues:
             priority_name = issue.fields.priority.name if issue.fields.priority else "-"
@@ -116,15 +198,20 @@ def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False)
             status_color = status_colors.get(status_name, "white")
             
             summary = issue.fields.summary
-            if len(summary) > 55 and not show_desc:
-                summary = summary[:55] + "..."
+            if len(summary) > 50 and not show_desc:
+                summary = summary[:50] + "..."
             
-            table.add_row(
+            row = [
                 issue.key,
                 summary,
                 f"[{status_color}]{status_name}[/{status_color}]",
                 f"[{priority_color}]{priority_name}[/{priority_color}]"
-            )
+            ]
+            
+            if show_time:
+                row.append(_format_time_spent(time_map.get(issue.key, 0)))
+            
+            table.add_row(*row)
         
         console.print(table)
         console.print()
@@ -242,7 +329,13 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
             jql = build_jql_from_filters(filters or {})
             console.print(f"[dim]JQL: {jql}[/dim]")
             
-            issues = jira.search_issues(jql, maxResults=50)
+            # Request timespent field if showing time
+            show_time = display.get("show_time_spent", False) if display else False
+            fields = "summary,status,priority,issuetype"
+            if show_time:
+                fields += ",timespent"
+            
+            issues = jira.search_issues(jql, maxResults=50, fields=fields)
             
             if not issues:
                 console.print("[yellow]No tasks found.[/yellow]")
@@ -253,10 +346,10 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
             
             if group_by:
                 # Grouped display
-                _display_grouped_tasks(issues, group_by, show_desc)
+                _display_grouped_tasks(issues, group_by, show_desc, show_time, jira)
             else:
                 # Standard table display
-                _display_tasks_table(issues, show_desc)
+                _display_tasks_table(issues, show_desc, show_time, jira)
             
             return OrchestratorResult(success=True, intent=Intent.QUERY_TASKS, message=f"Found {len(issues)} tasks")
             
