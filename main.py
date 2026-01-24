@@ -19,6 +19,117 @@ console = Console()
 app = typer.Typer()
 
 
+# --- DISPLAY HELPERS ---
+
+def _display_tasks_table(issues: list, show_desc: bool = False) -> None:
+    """Display tasks in a standard table format."""
+    table = Table(title="My Jira Tasks", show_lines=True)
+    table.add_column("Key", style="cyan", no_wrap=True)
+    table.add_column("Summary", style="white")
+    table.add_column("Status", style="magenta")
+    table.add_column("Priority", style="yellow")
+    
+    for issue in issues:
+        priority = issue.fields.priority.name if issue.fields.priority else "-"
+        summary = issue.fields.summary
+        if len(summary) > 60 and not show_desc:
+            summary = summary[:60] + "..."
+        table.add_row(
+            issue.key,
+            summary,
+            str(issue.fields.status),
+            priority
+        )
+    
+    console.print(table)
+    console.print(f"[dim]Showing {len(issues)} tasks[/dim]")
+
+
+def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False) -> None:
+    """Display tasks grouped by project, status, or priority."""
+    from collections import defaultdict
+    
+    # Group issues
+    groups = defaultdict(list)
+    
+    for issue in issues:
+        if group_by == "project":
+            # Group by project prefix (e.g., GBI, KFS)
+            key = issue.key.split("-")[0] if "-" in issue.key else "OTHER"
+        elif group_by == "status":
+            key = str(issue.fields.status)
+        elif group_by == "priority":
+            key = issue.fields.priority.name if issue.fields.priority else "None"
+        elif group_by == "type":
+            key = issue.fields.issuetype.name if issue.fields.issuetype else "Unknown"
+        else:
+            key = "All"
+        
+        groups[key].append(issue)
+    
+    # Sort groups by count (descending)
+    sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
+    
+    # Display summary header
+    total = len(issues)
+    summary_parts = [f"[bold]{k}[/bold]: {len(v)}" for k, v in sorted_groups]
+    console.print(f"\n[bold]Tasks by {group_by.title()}[/bold] ({total} total)")
+    console.print("  " + " | ".join(summary_parts))
+    console.print()
+    
+    # Status color mapping
+    status_colors = {
+        "In Progress": "blue",
+        "To Do": "white",
+        "Done": "green",
+        "Testing": "yellow",
+        "Done UAT": "green",
+        "Blocked": "red",
+    }
+    
+    priority_colors = {
+        "Highest": "red",
+        "High": "yellow",
+        "Medium": "white",
+        "Low": "dim",
+        "Lowest": "dim",
+    }
+    
+    # Display each group
+    for group_name, group_issues in sorted_groups:
+        # Create table for this group
+        table = Table(
+            title=f"{group_name} ({len(group_issues)})",
+            show_lines=False,
+            title_style="bold cyan",
+            border_style="dim",
+        )
+        table.add_column("Key", style="cyan", no_wrap=True, width=12)
+        table.add_column("Summary", style="white", ratio=3)
+        table.add_column("Status", style="magenta", width=14)
+        table.add_column("Priority", width=10)
+        
+        for issue in group_issues:
+            priority_name = issue.fields.priority.name if issue.fields.priority else "-"
+            priority_color = priority_colors.get(priority_name, "white")
+            status_name = str(issue.fields.status)
+            status_color = status_colors.get(status_name, "white")
+            
+            summary = issue.fields.summary
+            if len(summary) > 55 and not show_desc:
+                summary = summary[:55] + "..."
+            
+            table.add_row(
+                issue.key,
+                summary,
+                f"[{status_color}]{status_name}[/{status_color}]",
+                f"[{priority_color}]{priority_name}[/{priority_color}]"
+            )
+        
+        console.print(table)
+        console.print()
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -114,37 +225,38 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
         
         return OrchestratorResult(success=True, intent=Intent.LOG_WORK, message="Work logged successfully")
     
-    def query_tasks_handler(filters: dict) -> OrchestratorResult:
-        """Handle query_tasks intent."""
+    def query_tasks_handler(query_result: dict) -> OrchestratorResult:
+        """Handle query_tasks intent with grouping and display options."""
         try:
             jira = get_jira_client()
-            jql = build_jql_from_filters(filters)
+            
+            # Handle both old format (just filters) and new format (filters + display)
+            if "filters" in query_result:
+                filters = query_result.get("filters", {})
+                display = query_result.get("display", {})
+            else:
+                # Old format - just filters
+                filters = query_result
+                display = {}
+            
+            jql = build_jql_from_filters(filters or {})
             console.print(f"[dim]JQL: {jql}[/dim]")
             
-            issues = jira.search_issues(jql, maxResults=20)
+            issues = jira.search_issues(jql, maxResults=50)
             
             if not issues:
                 console.print("[yellow]No tasks found.[/yellow]")
                 return OrchestratorResult(success=True, intent=Intent.QUERY_TASKS, message="No tasks found")
             
-            # Build table
-            table = Table(title="My Jira Tasks", show_lines=True)
-            table.add_column("Key", style="cyan", no_wrap=True)
-            table.add_column("Summary", style="white")
-            table.add_column("Status", style="magenta")
-            table.add_column("Priority", style="yellow")
+            group_by = display.get("group_by") if display else None
+            show_desc = display.get("show_description", False) if display else False
             
-            for issue in issues:
-                priority = issue.fields.priority.name if issue.fields.priority else "-"
-                table.add_row(
-                    issue.key,
-                    issue.fields.summary[:60] + "..." if len(issue.fields.summary) > 60 else issue.fields.summary,
-                    str(issue.fields.status),
-                    priority
-                )
-            
-            console.print(table)
-            console.print(f"[dim]Showing {len(issues)} tasks[/dim]")
+            if group_by:
+                # Grouped display
+                _display_grouped_tasks(issues, group_by, show_desc)
+            else:
+                # Standard table display
+                _display_tasks_table(issues, show_desc)
             
             return OrchestratorResult(success=True, intent=Intent.QUERY_TASKS, message=f"Found {len(issues)} tasks")
             

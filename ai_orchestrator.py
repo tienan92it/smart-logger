@@ -221,26 +221,38 @@ Return ONLY JSON: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc":
 
 def parse_task_query(user_input: str, context: str = "") -> dict:
     """
-    Parse task query filters from natural language.
+    Parse task query filters and display options from natural language.
     Used when intent is QUERY_TASKS.
     """
     client = get_genai_client()
     
     prompt = f"""
-Convert this request into Jira search filters: "{user_input}"
+Convert this request into Jira search filters and display options: "{user_input}"
 
 {context}
 
-Extract filters if mentioned:
-- status: "To Do", "In Progress", "Done", "Blocked"
+Extract FILTERS if mentioned:
+- status: "To Do", "In Progress", "Done", "Blocked", "Testing", "Done UAT"
 - priority: "Highest", "High", "Medium", "Low", "Lowest"  
 - issue_type: "Bug", "Task", "Story", "Epic"
-- project: project key like "GBI", "PROJ"
+- project: project key like "GBI", "KFS", "KBI"
 - updated: relative time "-1w", "-1d", "-1m"
 - text_search: keywords to search
 
-Return ONLY JSON with filters found, null for not mentioned:
-{{"status": null, "priority": null, "issue_type": null, "project": null, "updated": null, "text_search": null}}
+Extract DISPLAY OPTIONS:
+- group_by: How to group results. Options: "project" (by ticket prefix like GBI, KFS), "status", "priority", "type", null (no grouping)
+- sort_by: How to sort. Options: "updated", "priority", "status", "key", null (default)
+- show_description: true if user wants to see descriptions, false otherwise
+
+IMPORTANT: If user says "group by project", "group by ticker", "group by prefix", "organize by project" -> set group_by to "project"
+
+Return ONLY JSON:
+{{"filters": {{"status": null, "priority": null, "issue_type": null, "project": null, "updated": null, "text_search": null}}, "display": {{"group_by": null, "sort_by": null, "show_description": false}}}}
+
+Examples:
+- "my tasks grouped by project" -> {{"filters": {{}}, "display": {{"group_by": "project", "sort_by": null, "show_description": false}}}}
+- "show in progress tasks by priority" -> {{"filters": {{"status": "In Progress"}}, "display": {{"group_by": "priority", "sort_by": null, "show_description": false}}}}
+- "GBI tasks grouped by status" -> {{"filters": {{"project": "GBI"}}, "display": {{"group_by": "status", "sort_by": null, "show_description": false}}}}
 """
     
     response = client.models.generate_content(
