@@ -253,45 +253,88 @@ Return ONLY JSON: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc":
     return json.loads(clean_json)
 
 
-def parse_task_query(user_input: str, context: str = "") -> dict:
+def plan_task_query(user_input: str, context: str = "") -> dict:
     """
-    Parse task query filters and display options from natural language.
-    Used when intent is QUERY_TASKS.
+    AI Agent plans the entire task query execution.
+    
+    Instead of rigid filter extraction, the AI:
+    1. Generates the JQL query directly
+    2. Decides how to display results
+    3. Specifies columns, grouping, sorting dynamically
+    
+    This is a more flexible, agentic approach.
     """
     client = get_genai_client()
     
     prompt = f"""
-Convert this request into Jira search filters and display options: "{user_input}"
+You are an AI agent helping a user query their Jira tasks. Analyze their request and plan the execution.
+
+User request: "{user_input}"
 
 {context}
 
-Extract FILTERS if mentioned:
-- status: "To Do", "In Progress", "Done", "Blocked", "Testing", "Done UAT"
-- priority: "Highest", "High", "Medium", "Low", "Lowest"  
-- issue_type: "Bug", "Task", "Story", "Epic"
-- project: project key like "GBI", "KFS", "KBI"
-- updated: relative time "-1w", "-1d", "-1m"
-- text_search: keywords to search
+Your job is to:
+1. Generate the appropriate JQL query
+2. Decide the best way to display results
+3. Choose which columns to show
+4. Determine if grouping or special formatting is needed
 
-Extract DISPLAY OPTIONS:
-- group_by: How to group results. Options: "project" (by ticket prefix like GBI, KFS), "status", "priority", "type", null (no grouping)
-- sort_by: How to sort. Options: "updated", "priority", "status", "key", null (default)
-- show_description: true if user wants to see descriptions, false otherwise
-- show_time_spent: true if user wants to see time logged/spent on tasks. Keywords: "time spent", "time logged", "hours", "how much time"
+JQL SYNTAX GUIDE:
+- assignee = currentUser() - your tasks
+- project = "GBI" - filter by project
+- status = "In Progress" - filter by status
+- priority = High - filter by priority (Highest, High, Medium, Low, Lowest)
+- issuetype = Bug - filter by type
+- updated >= -1w - updated in last week
+- ORDER BY priority DESC - sort by priority (highest first)
+- ORDER BY updated DESC - sort by recently updated
+- ORDER BY status ASC - sort by status
+- ORDER BY created DESC - sort by creation date
 
-IMPORTANT: 
-- If user says "group by project", "group by ticker", "group by prefix", "organize by project" -> set group_by to "project"
-- If user mentions "time", "hours", "time spent", "time logged", "how long" -> set show_time_spent to true
+DISPLAY OPTIONS:
+- format: "table" (standard table), "grouped" (group by a field), "compact" (minimal)
+- group_by: "project", "status", "priority", "type", or null
+- columns: array of columns to show, e.g. ["key", "summary", "status", "priority", "time_spent"]
+- show_time_spent: true if user wants to see logged time
 
-Return ONLY JSON:
-{{"filters": {{"status": null, "priority": null, "issue_type": null, "project": null, "updated": null, "text_search": null}}, "display": {{"group_by": null, "sort_by": null, "show_description": false, "show_time_spent": false}}}}
+Think step by step:
+1. What is the user asking for?
+2. What JQL will get the right data?
+3. How should results be displayed to match their expectation?
+
+Return ONLY valid JSON:
+{{
+  "reasoning": "Brief explanation of your understanding and plan",
+  "jql": "the JQL query string",
+  "display": {{
+    "format": "table|grouped|compact",
+    "group_by": "field name or null",
+    "columns": ["key", "summary", "status", "priority"],
+    "show_time_spent": false
+  }}
+}}
 
 Examples:
-- "my tasks grouped by project" -> {{"filters": {{}}, "display": {{"group_by": "project", "sort_by": null, "show_description": false, "show_time_spent": false}}}}
-- "show in progress tasks by priority" -> {{"filters": {{"status": "In Progress"}}, "display": {{"group_by": "priority", "sort_by": null, "show_description": false, "show_time_spent": false}}}}
-- "GBI tasks grouped by status" -> {{"filters": {{"project": "GBI"}}, "display": {{"group_by": "status", "sort_by": null, "show_description": false, "show_time_spent": false}}}}
-- "show my tasks with time spent" -> {{"filters": {{}}, "display": {{"group_by": null, "sort_by": null, "show_description": false, "show_time_spent": true}}}}
-- "how much time on GBI tasks" -> {{"filters": {{"project": "GBI"}}, "display": {{"group_by": null, "sort_by": null, "show_description": false, "show_time_spent": true}}}}
+- "show my tasks order by priority" -> {{
+    "reasoning": "User wants their tasks sorted by priority, highest first",
+    "jql": "assignee = currentUser() ORDER BY priority DESC",
+    "display": {{"format": "table", "group_by": null, "columns": ["key", "summary", "status", "priority"], "show_time_spent": false}}
+  }}
+- "my GBI bugs grouped by status" -> {{
+    "reasoning": "User wants GBI project bugs, grouped by their status",
+    "jql": "assignee = currentUser() AND project = GBI AND issuetype = Bug ORDER BY status ASC",
+    "display": {{"format": "grouped", "group_by": "status", "columns": ["key", "summary", "priority"], "show_time_spent": false}}
+  }}
+- "in progress tasks with time spent" -> {{
+    "reasoning": "User wants in-progress tasks with time tracking info",
+    "jql": "assignee = currentUser() AND status = \\"In Progress\\" ORDER BY updated DESC",
+    "display": {{"format": "table", "group_by": null, "columns": ["key", "summary", "status", "time_spent"], "show_time_spent": true}}
+  }}
+- "high priority tasks grouped by project" -> {{
+    "reasoning": "User wants high priority tasks organized by project",
+    "jql": "assignee = currentUser() AND priority in (Highest, High) ORDER BY priority DESC",
+    "display": {{"format": "grouped", "group_by": "project", "columns": ["key", "summary", "status", "priority"], "show_time_spent": false}}
+  }}
 """
     
     response = client.models.generate_content(
@@ -301,6 +344,12 @@ Examples:
     
     clean_json = response.text.replace('```json', '').replace('```', '').strip()
     return json.loads(clean_json)
+
+
+# Keep old function for backward compatibility but mark as deprecated
+def parse_task_query(user_input: str, context: str = "") -> dict:
+    """DEPRECATED: Use plan_task_query instead. This is kept for backward compatibility."""
+    return plan_task_query(user_input, context)
 
 
 @dataclass

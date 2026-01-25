@@ -312,27 +312,41 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
         
         return OrchestratorResult(success=True, intent=Intent.LOG_WORK, message="Work logged successfully")
     
-    def query_tasks_handler(query_result: dict) -> OrchestratorResult:
-        """Handle query_tasks intent with grouping and display options."""
+    def query_tasks_handler(query_plan: dict) -> OrchestratorResult:
+        """
+        Handle query_tasks intent using AI-planned query.
+        
+        The AI agent plans:
+        - jql: The exact JQL query to execute
+        - display: How to format results (format, group_by, columns, show_time_spent)
+        - reasoning: Why this plan was chosen
+        """
         try:
             jira = get_jira_client()
             
-            # Handle both old format (just filters) and new format (filters + display)
-            if "filters" in query_result:
-                filters = query_result.get("filters", {})
-                display = query_result.get("display", {})
+            # Extract AI-planned query details
+            if "jql" in query_plan:
+                # New agentic format - AI generated the JQL directly
+                jql = query_plan["jql"]
+                display = query_plan.get("display", {})
+                reasoning = query_plan.get("reasoning", "")
+                
+                if reasoning:
+                    console.print(f"[dim]AI Plan: {reasoning}[/dim]")
             else:
-                # Old format - just filters
-                filters = query_result
-                display = {}
+                # Legacy format - build JQL from filters
+                filters = query_plan.get("filters", query_plan)
+                display = query_plan.get("display", {})
+                jql = build_jql_from_filters(filters or {})
             
-            jql = build_jql_from_filters(filters or {})
             console.print(f"[dim]JQL: {jql}[/dim]")
             
-            # Request timespent field if showing time
-            show_time = display.get("show_time_spent", False) if display else False
+            # Determine what fields to fetch
+            show_time = display.get("show_time_spent", False)
+            columns = display.get("columns", ["key", "summary", "status", "priority"])
+            
             fields = "summary,status,priority,issuetype"
-            if show_time:
+            if show_time or "time_spent" in columns:
                 fields += ",timespent"
             
             issues = jira.search_issues(jql, maxResults=50, fields=fields)
@@ -341,14 +355,14 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
                 console.print("[yellow]No tasks found.[/yellow]")
                 return OrchestratorResult(success=True, intent=Intent.QUERY_TASKS, message="No tasks found")
             
-            group_by = display.get("group_by") if display else None
-            show_desc = display.get("show_description", False) if display else False
+            # Display based on AI-chosen format
+            display_format = display.get("format", "table")
+            group_by = display.get("group_by")
+            show_desc = "description" in columns
             
-            if group_by:
-                # Grouped display
+            if display_format == "grouped" and group_by:
                 _display_grouped_tasks(issues, group_by, show_desc, show_time, jira)
             else:
-                # Standard table display
                 _display_tasks_table(issues, show_desc, show_time, jira)
             
             return OrchestratorResult(success=True, intent=Intent.QUERY_TASKS, message=f"Found {len(issues)} tasks")
