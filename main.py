@@ -386,12 +386,158 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
             console.print(f"[red]Jira Error: {e}[/red]")
             return OrchestratorResult(success=False, intent=Intent.TASK_DETAIL, message=str(e))
     
+    def work_summary_handler(period: str, project_filter: str = None) -> OrchestratorResult:
+        """Handle work_summary intent - show summary of worklogs."""
+        from datetime import datetime, timedelta
+        from collections import defaultdict
+        
+        try:
+            jira = get_jira_client()
+            
+            # Calculate date range
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            if period == "today":
+                start_date = today
+                end_date = today + timedelta(days=1)
+                period_label = "Today"
+            elif period == "yesterday":
+                start_date = today - timedelta(days=1)
+                end_date = today
+                period_label = "Yesterday"
+            elif period == "this_week":
+                start_date = today - timedelta(days=today.weekday())
+                end_date = today + timedelta(days=1)
+                period_label = "This Week"
+            elif period == "last_week":
+                start_date = today - timedelta(days=today.weekday() + 7)
+                end_date = today - timedelta(days=today.weekday())
+                period_label = "Last Week"
+            elif period == "this_month":
+                start_date = today.replace(day=1)
+                end_date = today + timedelta(days=1)
+                period_label = "This Month"
+            elif period == "last_month":
+                first_of_month = today.replace(day=1)
+                start_date = (first_of_month - timedelta(days=1)).replace(day=1)
+                end_date = first_of_month
+                period_label = "Last Month"
+            else:
+                # Default to last week
+                start_date = today - timedelta(days=7)
+                end_date = today + timedelta(days=1)
+                period_label = "Last 7 Days"
+            
+            start_str = start_date.strftime("%Y-%m-%d")
+            end_str = end_date.strftime("%Y-%m-%d")
+            
+            console.print(f"[dim]Fetching worklogs from {start_str} to {end_str}...[/dim]")
+            
+            # Build JQL to find issues with worklogs in period
+            jql = f'worklogDate >= "{start_str}" AND worklogDate < "{end_str}" AND worklogAuthor = currentUser()'
+            if project_filter:
+                jql += f' AND project = "{project_filter}"'
+            jql += ' ORDER BY updated DESC'
+            
+            issues = jira.search_issues(jql, maxResults=100, fields="summary,project,timespent,worklog")
+            
+            if not issues:
+                console.print(f"[yellow]No worklogs found for {period_label}.[/yellow]")
+                return OrchestratorResult(success=True, intent=Intent.WORK_SUMMARY, message="No worklogs found")
+            
+            # Collect worklog data
+            total_seconds = 0
+            by_project = defaultdict(lambda: {"seconds": 0, "issues": []})
+            by_date = defaultdict(int)
+            
+            current_user = os.getenv("JIRA_EMAIL", "").lower()
+            
+            for issue in issues:
+                try:
+                    worklogs = jira.worklogs(issue.key)
+                    for wl in worklogs:
+                        # Filter by author and date
+                        wl_author = getattr(wl, 'author', None)
+                        if wl_author:
+                            author_email = getattr(wl_author, 'emailAddress', '').lower()
+                            author_name = getattr(wl_author, 'displayName', '').lower()
+                        else:
+                            continue
+                        
+                        if current_user not in author_email and current_user not in author_name:
+                            continue
+                        
+                        wl_started = getattr(wl, 'started', '')
+                        if wl_started:
+                            wl_date = datetime.strptime(wl_started[:10], "%Y-%m-%d")
+                            if start_date <= wl_date < end_date:
+                                seconds = getattr(wl, 'timeSpentSeconds', 0)
+                                total_seconds += seconds
+                                
+                                project_key = issue.key.split("-")[0]
+                                by_project[project_key]["seconds"] += seconds
+                                if issue.key not in [i["key"] for i in by_project[project_key]["issues"]]:
+                                    by_project[project_key]["issues"].append({
+                                        "key": issue.key,
+                                        "summary": issue.fields.summary,
+                                        "seconds": 0
+                                    })
+                                # Add to issue
+                                for i in by_project[project_key]["issues"]:
+                                    if i["key"] == issue.key:
+                                        i["seconds"] += seconds
+                                
+                                date_key = wl_date.strftime("%Y-%m-%d (%a)")
+                                by_date[date_key] += seconds
+                                
+                except Exception:
+                    continue
+            
+            if total_seconds == 0:
+                console.print(f"[yellow]No worklogs found for {period_label}.[/yellow]")
+                return OrchestratorResult(success=True, intent=Intent.WORK_SUMMARY, message="No worklogs found")
+            
+            # Display summary
+            total_hours = total_seconds / 3600
+            
+            console.print(f"\n[bold cyan]Work Summary: {period_label}[/bold cyan]")
+            console.print(f"[bold green]Total: {_format_time_spent(total_seconds)} ({total_hours:.1f} hours)[/bold green]\n")
+            
+            # By date
+            if by_date:
+                console.print("[bold]By Date:[/bold]")
+                for date_key in sorted(by_date.keys()):
+                    hours = by_date[date_key] / 3600
+                    console.print(f"  {date_key}: {_format_time_spent(by_date[date_key])} ({hours:.1f}h)")
+                console.print()
+            
+            # By project
+            if by_project:
+                console.print("[bold]By Project:[/bold]")
+                for proj_key in sorted(by_project.keys(), key=lambda x: by_project[x]["seconds"], reverse=True):
+                    proj_data = by_project[proj_key]
+                    proj_hours = proj_data["seconds"] / 3600
+                    console.print(f"\n  [cyan]{proj_key}[/cyan]: {_format_time_spent(proj_data['seconds'])} ({proj_hours:.1f}h)")
+                    
+                    # Show issues
+                    sorted_issues = sorted(proj_data["issues"], key=lambda x: x["seconds"], reverse=True)
+                    for issue_info in sorted_issues[:10]:  # Limit to top 10
+                        summary = issue_info["summary"][:45] + "..." if len(issue_info["summary"]) > 45 else issue_info["summary"]
+                        console.print(f"    {issue_info['key']}: {_format_time_spent(issue_info['seconds'])} - {summary}")
+            
+            return OrchestratorResult(success=True, intent=Intent.WORK_SUMMARY, message=f"Total: {total_hours:.1f} hours")
+            
+        except Exception as e:
+            console.print(f"[red]Jira Error: {e}[/red]")
+            return OrchestratorResult(success=False, intent=Intent.WORK_SUMMARY, message=str(e))
+    
     # Run orchestrator
     result = orchestrate(
         user_input=input_text,
         log_work_handler=log_work_handler,
         query_tasks_handler=query_tasks_handler,
         task_detail_handler=task_detail_handler,
+        work_summary_handler=work_summary_handler,
     )
     
     # Handle clarify and help intents

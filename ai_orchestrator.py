@@ -37,6 +37,7 @@ class Intent(Enum):
     LOG_WORK = "log_work"
     QUERY_TASKS = "query_tasks"
     TASK_DETAIL = "task_detail"
+    WORK_SUMMARY = "work_summary"  # Summary/report of worklogs
     HELP = "help"
     CLARIFY = "clarify"
 
@@ -82,17 +83,21 @@ Classify into ONE of these intents:
    
 3. "task_detail" - User wants DETAILS about a SPECIFIC task. Usually mentions a specific issue key with "what is", "details", "info about".
    Extract: issue_key
+
+4. "work_summary" - User wants a SUMMARY or REPORT of their LOGGED WORK/WORKLOGS. Keywords: "summary", "report", "how much did I work", "my work last week", "worklog summary", "time report".
+   Extract: period (e.g., "last_week", "last_month", "this_week", "this_month", "today", "yesterday"), project (optional filter)
    
-4. "help" - User is asking how to use the tool or what it can do.
+5. "help" - User is asking how to use the tool or what it can do.
    Extract: nothing
    
-5. "clarify" - Input is ambiguous or doesn't fit other categories. Need more information.
+6. "clarify" - Input is ambiguous or doesn't fit other categories. Need more information.
    Extract: clarification_message (what to ask the user)
 
 IMPORTANT RULES:
 - If there's a time indicator (2h, 30m, 1 hour, etc.), it's almost always "log_work"
 - "my tasks", "my issues", "show tasks" without time = "query_tasks"
 - Just an issue key with "what is" or "details" = "task_detail"
+- "summary", "report", "my work last week/month" = "work_summary" (NOT query_tasks!)
 - If unsure between query_tasks and log_work, check for time indicator
 
 Return ONLY valid JSON:
@@ -103,6 +108,9 @@ Examples:
 - "my GBI tasks" -> {{"intent": "query_tasks", "confidence": 0.9, "extracted_data": {{"filters": {{"project": "GBI"}}}}, "message": null}}
 - "show in progress tasks" -> {{"intent": "query_tasks", "confidence": 0.9, "extracted_data": {{"filters": {{"status": "In Progress"}}}}, "message": null}}
 - "what is GBI-123" -> {{"intent": "task_detail", "confidence": 0.9, "extracted_data": {{"issue_key": "GBI-123"}}, "message": null}}
+- "summary my work last week" -> {{"intent": "work_summary", "confidence": 0.95, "extracted_data": {{"period": "last_week", "project": null}}, "message": null}}
+- "report my worklogs this month" -> {{"intent": "work_summary", "confidence": 0.95, "extracted_data": {{"period": "this_month", "project": null}}, "message": null}}
+- "how much did I work on GBI last week" -> {{"intent": "work_summary", "confidence": 0.9, "extracted_data": {{"period": "last_week", "project": "GBI"}}, "message": null}}
 - "help" -> {{"intent": "help", "confidence": 1.0, "extracted_data": {{}}, "message": null}}
 - "GBI-123" -> {{"intent": "clarify", "confidence": 0.5, "extracted_data": {{"issue_key": "GBI-123"}}, "message": "Did you want to log time on GBI-123, see its details, or something else?"}}
 """
@@ -142,6 +150,32 @@ def _fallback_classification(user_input: str) -> ClassificationResult:
             extracted_data={"raw_input": user_input},
             message=None,
         )
+    
+    # Check for work summary patterns (before query patterns)
+    summary_patterns = ["summary", "report", "how much did i work", "my work last", "worklog", "time report"]
+    for pattern in summary_patterns:
+        if pattern in text:
+            # Try to detect period
+            period = "last_week"  # default
+            if "today" in text:
+                period = "today"
+            elif "yesterday" in text:
+                period = "yesterday"
+            elif "this week" in text:
+                period = "this_week"
+            elif "this month" in text:
+                period = "this_month"
+            elif "last month" in text:
+                period = "last_month"
+            elif "last week" in text:
+                period = "last_week"
+            
+            return ClassificationResult(
+                intent=Intent.WORK_SUMMARY,
+                confidence=0.7,
+                extracted_data={"period": period, "project": None},
+                message=None,
+            )
     
     # Check for query patterns
     query_patterns = ["my task", "my issue", "show", "list", "find", "what are", "in progress", "to do", "blocked"]
@@ -283,6 +317,7 @@ def orchestrate(
     log_work_handler: Optional[Callable] = None,
     query_tasks_handler: Optional[Callable] = None,
     task_detail_handler: Optional[Callable] = None,
+    work_summary_handler: Optional[Callable] = None,
 ) -> OrchestratorResult:
     """
     Main orchestrator entry point.
@@ -297,6 +332,7 @@ def orchestrate(
         log_work_handler: Function to call for logging work
         query_tasks_handler: Function to call for querying tasks
         task_detail_handler: Function to call for task details
+        work_summary_handler: Function to call for work summary/reports
     """
     # 1. Load memory and build context
     memory = load_memory()
@@ -378,6 +414,25 @@ def orchestrate(
                 message="Task detail handler not configured",
             )
     
+    elif classification.intent == Intent.WORK_SUMMARY:
+        if work_summary_handler:
+            try:
+                period = classification.extracted_data.get("period", "last_week")
+                project = classification.extracted_data.get("project")
+                result = work_summary_handler(period, project)
+            except Exception as e:
+                result = OrchestratorResult(
+                    success=False,
+                    intent=classification.intent,
+                    message=f"Failed to generate summary: {e}",
+                )
+        else:
+            result = OrchestratorResult(
+                success=False,
+                intent=classification.intent,
+                message="Work summary handler not configured",
+            )
+    
     elif classification.intent == Intent.HELP:
         result = OrchestratorResult(
             success=True,
@@ -418,12 +473,17 @@ Examples:
   List tasks:
     "my tasks"
     "show in progress issues"
-    "my GBI bugs"
-    "high priority tasks"
+    "my GBI bugs grouped by status"
+    "high priority tasks with time"
   
   Task details:
     "what is GBI-123"
     "details on KFS-456"
+  
+  Work summary:
+    "summary my work last week"
+    "report my worklogs this month"
+    "how much did I work on GBI last week"
 
 Commands:
   log         - Explicitly log work (e.g., log "2h on GBI-123")
