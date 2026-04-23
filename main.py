@@ -1,12 +1,13 @@
 import os
+import sys
 import json
 import typer
 from rich.console import Console
 from rich.table import Table
-from typing import Optional
+from typing import List, Optional
 from dotenv import load_dotenv
 from jira import JIRA
-from google import genai
+from genai_client import get_genai_client, default_gemini_model
 
 from notion_form import submit_notion_form, NotionFormError, NotionAuthError
 from notion_auth import get_notion_credentials, clear_token, load_stored_token
@@ -17,6 +18,35 @@ from ai_orchestrator import orchestrate, Intent, OrchestratorResult
 load_dotenv()
 console = Console()
 app = typer.Typer()
+
+# CLI subcommand names (hyphenated). Used so Typer does not treat them as bare NLP.
+_SUBCOMMAND_NAMES = frozenset(
+    {"log", "tasks", "notion-login", "notion-status", "notion-logout", "_smart_"}
+)
+
+
+def _prepend_smart_if_needed() -> None:
+    """
+    Route `smart-log <natural language>` to hidden command `_smart_` so it does not
+    steal tokens meant for real subcommands (e.g. `notion-login`).
+    """
+    argv = sys.argv[1:]
+    if not argv:
+        return
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-p", "--project") and i + 1 < len(argv):
+            i += 2
+            continue
+        break
+    if i >= len(argv):
+        return
+    next_tok = argv[i]
+    if next_tok.startswith("-"):
+        return
+    if next_tok in _SUBCOMMAND_NAMES:
+        return
+    sys.argv = [sys.argv[0], "_smart_"] + sys.argv[1:]
 
 
 # --- DISPLAY HELPERS ---
@@ -218,11 +248,7 @@ def _display_grouped_tasks(issues: list, group_by: str, show_desc: bool = False,
 
 
 @app.callback(invoke_without_command=True)
-def main(
-    ctx: typer.Context,
-    input_text: Optional[str] = typer.Argument(None, help="Natural language input (e.g., '2h on GBI-123' or 'my tasks')"),
-    project: Optional[str] = typer.Option(None, "--project", "-p", help="Notion project name for logging"),
-):
+def main(ctx: typer.Context):
     """
     Smart Logger - AI-powered work logging to Jira and Notion.
     
@@ -234,11 +260,7 @@ def main(
         python main.py "show in progress bugs"
         python main.py "what is GBI-123"
     """
-    if ctx.invoked_subcommand is None and input_text:
-        # Smart mode - use AI orchestrator
-        _smart_handler(input_text, project)
-    elif ctx.invoked_subcommand is None:
-        # No input and no subcommand - show help
+    if ctx.invoked_subcommand is None:
         console.print(ctx.get_help())
 
 # --- SMART HANDLER ---
@@ -563,6 +585,26 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
         console.print(f"[red]Error: {result.message}[/red]")
 
 
+@app.command("_smart_", hidden=True)
+def _smart_nlp(
+    ctx: typer.Context,
+    project: Optional[str] = typer.Option(
+        None, "--project", "-p", help="Notion project name for logging"
+    ),
+    words: List[str] = typer.Argument(
+        ...,
+        metavar="TEXT",
+        help="Natural language (e.g. '2h on GBI-123' or 'my tasks')",
+    ),
+):
+    """Internal entry for bare `smart-log <text>` (see _prepend_smart_if_needed)."""
+    input_text = " ".join(words).strip()
+    if not input_text:
+        console.print(ctx.get_help())
+        raise typer.Exit(0)
+    _smart_handler(input_text, project)
+
+
 # --- SERVICES ---
 
 def get_jira_client():
@@ -570,9 +612,6 @@ def get_jira_client():
         server=os.getenv("JIRA_SERVER"),
         basic_auth=(os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN"))
     )
-
-def get_genai_client():
-    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 def ai_parse_log(natural_input: str):
     """
@@ -610,7 +649,7 @@ def ai_parse_log(natural_input: str):
     - "1h researching Redis Sentinel" -> {{"key": "...", "time_jira": "1h", "time_hours": 1.0, "desc": "researching Redis Sentinel", "task_type": "Research"}}
     """
     response = client.models.generate_content(
-        model='gemini-2.0-flash',  # Fast & Free tier eligible
+        model=default_gemini_model(),
         contents=prompt
     )
     # Simple cleanup to ensure we get just the JSON
@@ -648,7 +687,7 @@ def ai_parse_task_query(natural_input: str) -> dict:
     Example: {{"status": "In Progress", "priority": "High", "issue_type": null, "project": null, "updated": "-1w", "created": null, "text_search": null}}
     """
     response = client.models.generate_content(
-        model='gemini-2.0-flash',
+        model=default_gemini_model(),
         contents=prompt
     )
     clean_json = response.text.replace('```json', '').replace('```', '').strip()
@@ -915,5 +954,11 @@ def tasks(
         console.print(f"[red]❌ Jira Error: {e}[/red]")
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Entry point for the `smart-log` console script (must run argv preprocessing)."""
+    _prepend_smart_if_needed()
     app()
+
+
+if __name__ == "__main__":
+    cli()

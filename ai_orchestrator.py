@@ -15,9 +15,9 @@ from typing import Optional, Callable
 from dataclasses import dataclass
 from enum import Enum
 from dotenv import load_dotenv
-from google import genai
 from rich.console import Console
 
+from genai_client import get_genai_client, default_gemini_model
 from memory_bank import (
     load_memory,
     save_memory,
@@ -49,11 +49,6 @@ class ClassificationResult:
     confidence: float
     extracted_data: dict
     message: Optional[str] = None  # For clarify/help intents
-
-
-def get_genai_client():
-    """Get Google GenAI client."""
-    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 def classify_intent(user_input: str, context: str = "") -> ClassificationResult:
@@ -116,7 +111,7 @@ Examples:
 """
     
     response = client.models.generate_content(
-        model='gemini-2.0-flash',
+        model=default_gemini_model(),
         contents=prompt
     )
     
@@ -245,7 +240,7 @@ Return ONLY JSON: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc":
 """
     
     response = client.models.generate_content(
-        model='gemini-2.0-flash',
+        model=default_gemini_model(),
         contents=prompt
     )
     
@@ -338,7 +333,7 @@ Examples:
 """
     
     response = client.models.generate_content(
-        model='gemini-2.0-flash',
+        model=default_gemini_model(),
         contents=prompt
     )
     

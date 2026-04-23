@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-smart-log = "main:app"
+smart-log = "main:cli"
 
 [tool.setuptools]
-py-modules = ["main", "notion_auth", "notion_form", "memory_bank", "ai_orchestrator"]
+py-modules = ["main", "notion_auth", "notion_form", "memory_bank", "ai_orchestrator", "genai_client"]

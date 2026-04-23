@@ -6,6 +6,8 @@ Submits task logs via Notion's internal form API.
 
 import os
 import json
+import time
+import random
 import requests
 from datetime import datetime
 from typing import Optional
@@ -68,6 +70,31 @@ def get_project_page_id(project_name: str) -> Optional[str]:
     
     # Fallback to default
     return os.getenv("NOTION_PROJECT_DEFAULT")
+
+
+_TRANSIENT_HTTP = frozenset({429, 502, 503, 504})
+_MAX_TRANSIENT_ATTEMPTS = 5
+
+
+def _notion_response_retryable(response: requests.Response) -> bool:
+    """True when Notion asks us to retry (transient infra / rate limits)."""
+    if response.status_code in _TRANSIENT_HTTP:
+        return True
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    def walk(obj) -> bool:
+        if isinstance(obj, dict):
+            if obj.get("retryable") is True:
+                return True
+            return any(walk(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(walk(x) for x in obj)
+        return False
+
+    return walk(data)
 
 
 def submit_notion_form(
@@ -171,47 +198,60 @@ def submit_notion_form(
         cookies["notion_user_id"] = creds["user_id"]
     
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            cookies=cookies,
-            timeout=30,
-        )
-        
-        # Check for auth errors
-        if response.status_code == 401 or "Unauthorized" in response.text:
-            if retry_on_auth_fail:
-                console.print("[yellow]Token expired. Re-authenticating...[/yellow]")
-                clear_token()
-                # Get fresh token
-                email = os.getenv("NOTION_EMAIL")
-                new_creds = get_token_via_playwright(email)
-                save_token(new_creds)
-                # Retry once
-                return submit_notion_form(
-                    issue_key=issue_key,
-                    description=description,
-                    time_hours=time_hours,
-                    task_type=task_type,
-                    project=project,
-                    date=date,
-                    retry_on_auth_fail=False,  # Don't retry again
+        for attempt in range(_MAX_TRANSIENT_ATTEMPTS):
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                cookies=cookies,
+                timeout=30,
+            )
+
+            # Check for auth errors
+            if response.status_code == 401 or "Unauthorized" in response.text:
+                if retry_on_auth_fail:
+                    console.print("[yellow]Token expired. Re-authenticating...[/yellow]")
+                    clear_token()
+                    # Get fresh token
+                    email = os.getenv("NOTION_EMAIL")
+                    new_creds = get_token_via_playwright(email)
+                    save_token(new_creds)
+                    # Retry once
+                    return submit_notion_form(
+                        issue_key=issue_key,
+                        description=description,
+                        time_hours=time_hours,
+                        task_type=task_type,
+                        project=project,
+                        date=date,
+                        retry_on_auth_fail=False,  # Don't retry again
+                    )
+                else:
+                    raise NotionAuthError("Authentication failed. Please run 'notion-login' to re-authenticate.")
+
+            if response.ok:
+                return response.json()
+
+            if _notion_response_retryable(response) and attempt < _MAX_TRANSIENT_ATTEMPTS - 1:
+                delay = min(30.0, (2 ** (attempt + 1)) + random.uniform(0, 1.0))
+                console.print(
+                    f"[yellow]Notion temporarily unavailable ({response.status_code}), "
+                    f"retrying in {delay:.1f}s (attempt {attempt + 1}/{_MAX_TRANSIENT_ATTEMPTS})...[/yellow]"
                 )
-            else:
-                raise NotionAuthError("Authentication failed. Please run 'notion-login' to re-authenticate.")
-        
-        # Debug: print response for errors
-        if response.status_code >= 400:
-            console.print(f"[red]Response status: {response.status_code}[/red]")
-            console.print(f"[red]Response body: {response.text[:500]}[/red]")
-            console.print(f"\n[yellow]Debug - Payload sent:[/yellow]")
-            console.print(f"  Form ID: {form_id}")
-            console.print(f"  Space ID: {space_id}")
-            console.print(f"  Properties: {list(payload['blockProperties'].keys())}")
-        
-        response.raise_for_status()
-        return response.json()
-        
+                time.sleep(delay)
+                continue
+
+            # Debug: print response for errors (final failure or non-retryable)
+            if response.status_code >= 400:
+                console.print(f"[red]Response status: {response.status_code}[/red]")
+                console.print(f"[red]Response body: {response.text[:500]}[/red]")
+                console.print("\n[yellow]Debug - Payload sent:[/yellow]")
+                console.print(f"  Form ID: {form_id}")
+                console.print(f"  Space ID: {space_id}")
+                console.print(f"  Properties: {list(payload['blockProperties'].keys())}")
+
+            response.raise_for_status()
+            return response.json()
+
     except requests.exceptions.RequestException as e:
         raise NotionFormError(f"Failed to submit form: {e}")
