@@ -17,6 +17,7 @@ smart-log "show in progress bugs"
 ## Features
 
 - **Smart Intent Detection** - Just describe what you want, AI routes to the right action
+- **Multi-Provider AI** - Gemini (default), OpenAI, or Anthropic — switch via `AI_PROVIDER`
 - **Context-Aware Memory** - Learns your projects, issues, and patterns over time
 - **Natural Language Parsing** - AI extracts ticket, time, and description
 - **Smart Task Classification** - Auto-detects: Development, Design, Meeting, Documentation, Research, Planning
@@ -92,8 +93,17 @@ JIRA_SERVER=https://your-company.atlassian.net
 JIRA_EMAIL=your@email.com
 JIRA_API_TOKEN=your-jira-api-token
 
-# Gemini AI (for natural language parsing)
+# AI Provider (gemini | openai | anthropic) — defaults to gemini
+AI_PROVIDER=gemini
+# Optional override; otherwise a sane per-provider default is used
+# AI_MODEL=gemini-2.0-flash
+
+# Gemini (default)
 GEMINI_API_KEY=your-gemini-api-key
+# OpenAI (when AI_PROVIDER=openai)
+# OPENAI_API_KEY=sk-...
+# Anthropic (when AI_PROVIDER=anthropic)
+# ANTHROPIC_API_KEY=sk-ant-...
 
 # Notion Form Configuration
 NOTION_FORM_ID=2cc64b29-b84c-8090-8765-c0d8656e212f
@@ -163,6 +173,22 @@ smart-log tasks "in progress"
 smart-log tasks --status "In Progress" -n 10
 ```
 
+### AI Providers
+
+Smart Logger speaks to any of three LLM backends through a thin abstraction
+in `ai_client.py`. Pick one with `AI_PROVIDER` and supply the matching API key.
+
+| Provider    | `AI_PROVIDER` | Auth env                                  | Default model               | Install                                  |
+|-------------|---------------|-------------------------------------------|------------------------------|------------------------------------------|
+| Gemini      | `gemini`      | `GEMINI_API_KEY` *(or Vertex ADC)*        | `gemini-2.0-flash`           | included by default                       |
+| OpenAI      | `openai`      | `OPENAI_API_KEY` *(opt. `OPENAI_BASE_URL`)* | `gpt-4o-mini`              | `pip install 'smart-logger[openai]'`     |
+| Anthropic   | `anthropic`   | `ANTHROPIC_API_KEY`                       | `claude-3-5-haiku-latest`    | `pip install 'smart-logger[anthropic]'`  |
+
+Override the model with `AI_MODEL=...`. The OpenAI provider also accepts
+`OPENAI_BASE_URL` for any OpenAI-compatible endpoint (Azure OpenAI, OpenRouter,
+local servers, etc.). SDKs for non-default providers are lazy-imported, so you
+only need to install what you actually use.
+
 ### Notion Authentication
 
 ```bash
@@ -196,6 +222,7 @@ The AI automatically classifies your work into these categories:
 smart-logger/
 ├── main.py             # CLI commands and smart handler
 ├── ai_orchestrator.py  # AI intent classification and routing
+├── ai_client.py        # Provider-agnostic LLM client (Gemini/OpenAI/Anthropic)
 ├── memory_bank.py      # Persistent context/memory storage
 ├── notion_auth.py      # Playwright-based Notion authentication
 ├── notion_form.py      # Notion form submission via internal API

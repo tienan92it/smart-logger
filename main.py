@@ -7,7 +7,7 @@ from rich.table import Table
 from typing import List, Optional
 from dotenv import load_dotenv
 from jira import JIRA
-from genai_client import get_genai_client, default_gemini_model
+from ai_client import get_ai_client
 
 from notion_form import submit_notion_form, NotionFormError, NotionAuthError
 from notion_auth import get_notion_credentials, clear_token, load_stored_token
@@ -18,6 +18,15 @@ from ai_orchestrator import orchestrate, Intent, OrchestratorResult
 load_dotenv()
 console = Console()
 app = typer.Typer()
+
+
+def _env_flag(name: str) -> bool:
+    """Parse common truthy env values for local operational switches."""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dry_run_enabled() -> bool:
+    return _env_flag("SMART_LOG_DRY_RUN")
 
 # CLI subcommand names (hyphenated). Used so Typer does not treat them as bare NLP.
 _SUBCOMMAND_NAMES = frozenset(
@@ -282,6 +291,10 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
         task_type = log_data.get('task_type', 'Development')
         
         console.print(f"[green]Parsed:[/green] {issue_key or 'No ticket'} | {time_jira} ({time_hours}h) | {task_type} | {description}")
+
+        if _dry_run_enabled():
+            console.print("[yellow]Dry run enabled: skipping Jira and Notion submission.[/yellow]")
+            return OrchestratorResult(success=True, intent=Intent.LOG_WORK, message="Dry run completed", data=log_data)
         
         # Try to log to Jira
         issue_title = ""
@@ -617,7 +630,7 @@ def ai_parse_log(natural_input: str):
     """
     Uses AI to convert natural language into structured data.
     """
-    client = get_genai_client()
+    client = get_ai_client()
     
     # Task type classification mapping
     task_type_guide = """
@@ -648,12 +661,8 @@ def ai_parse_log(natural_input: str):
     - "30m writing API docs for GBI-123" -> {{"key": "GBI-123", "time_jira": "30m", "time_hours": 0.5, "desc": "writing API docs", "task_type": "Documentation"}}
     - "1h researching Redis Sentinel" -> {{"key": "...", "time_jira": "1h", "time_hours": 1.0, "desc": "researching Redis Sentinel", "task_type": "Research"}}
     """
-    response = client.models.generate_content(
-        model=default_gemini_model(),
-        contents=prompt
-    )
-    # Simple cleanup to ensure we get just the JSON
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
+    raw = client.generate(prompt)
+    clean_json = raw.replace('```json', '').replace('```', '').strip()
     
     try:
         return json.loads(clean_json)
@@ -669,7 +678,7 @@ def ai_parse_task_query(natural_input: str) -> dict:
     """
     Uses AI to convert natural language into JQL filter components.
     """
-    client = get_genai_client()
+    client = get_ai_client()
     
     prompt = f"""
     Convert this natural language request into Jira JQL filter components: "{natural_input}"
@@ -686,11 +695,8 @@ def ai_parse_task_query(natural_input: str) -> dict:
     Return ONLY a JSON object with the filters found. Use null for filters not mentioned.
     Example: {{"status": "In Progress", "priority": "High", "issue_type": null, "project": null, "updated": "-1w", "created": null, "text_search": null}}
     """
-    response = client.models.generate_content(
-        model=default_gemini_model(),
-        contents=prompt
-    )
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
+    raw = client.generate(prompt)
+    clean_json = raw.replace('```json', '').replace('```', '').strip()
     return json.loads(clean_json)
 
 
@@ -765,6 +771,10 @@ def log(
     task_type = parsed_data.get('task_type', 'Development')
     
     console.print(f"[green]✔ Parsed:[/green] {issue_key or 'No ticket'} | {time_jira} ({time_hours}h) | {task_type} | {description}")
+
+    if _dry_run_enabled():
+        console.print("[yellow]Dry run enabled: skipping Jira and Notion submission.[/yellow]")
+        return
 
     # 2. Try to log to Jira (only if valid ticket key)
     issue_title = ""

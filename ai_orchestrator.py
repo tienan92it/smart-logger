@@ -17,7 +17,7 @@ from enum import Enum
 from dotenv import load_dotenv
 from rich.console import Console
 
-from genai_client import get_genai_client, default_gemini_model
+from ai_client import get_ai_client
 from memory_bank import (
     load_memory,
     save_memory,
@@ -60,7 +60,7 @@ def classify_intent(user_input: str, context: str = "") -> ClassificationResult:
     - confidence: How confident the AI is (0-1)
     - extracted_data: Relevant data extracted based on intent
     """
-    client = get_genai_client()
+    client = get_ai_client()
     
     prompt = f"""
 You are an intent classifier for a work logging tool. Analyze the user input and classify their intent.
@@ -110,12 +110,8 @@ Examples:
 - "GBI-123" -> {{"intent": "clarify", "confidence": 0.5, "extracted_data": {{"issue_key": "GBI-123"}}, "message": "Did you want to log time on GBI-123, see its details, or something else?"}}
 """
     
-    response = client.models.generate_content(
-        model=default_gemini_model(),
-        contents=prompt
-    )
-    
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
+    raw = client.generate(prompt)
+    clean_json = raw.replace('```json', '').replace('```', '').strip()
     
     try:
         result = json.loads(clean_json)
@@ -216,7 +212,7 @@ def parse_log_data(user_input: str, context: str = "") -> dict:
     Parse work log details from natural language.
     Used when intent is LOG_WORK.
     """
-    client = get_genai_client()
+    client = get_ai_client()
     
     # Get task type hint from memory patterns
     memory = load_memory()
@@ -239,12 +235,8 @@ Extract:
 Return ONLY JSON: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc": "...", "task_type": "..."}}
 """
     
-    response = client.models.generate_content(
-        model=default_gemini_model(),
-        contents=prompt
-    )
-    
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
+    raw = client.generate(prompt)
+    clean_json = raw.replace('```json', '').replace('```', '').strip()
     return json.loads(clean_json)
 
 
@@ -259,7 +251,7 @@ def plan_task_query(user_input: str, context: str = "") -> dict:
     
     This is a more flexible, agentic approach.
     """
-    client = get_genai_client()
+    client = get_ai_client()
     
     prompt = f"""
 You are an AI agent helping a user query their Jira tasks. Analyze their request and plan the execution.
@@ -332,12 +324,8 @@ Examples:
   }}
 """
     
-    response = client.models.generate_content(
-        model=default_gemini_model(),
-        contents=prompt
-    )
-    
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
+    raw = client.generate(prompt)
+    clean_json = raw.replace('```json', '').replace('```', '').strip()
     return json.loads(clean_json)
 
 

@@ -18,8 +18,13 @@ dependencies = [
     "typer>=0.9.0",
 ]
 
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+anthropic = ["anthropic>=0.34.0"]
+all = ["openai>=1.0.0", "anthropic>=0.34.0"]
+
 [project.scripts]
 smart-log = "main:cli"
 
 [tool.setuptools]
-py-modules = ["main", "notion_auth", "notion_form", "memory_bank", "ai_orchestrator", "genai_client"]
+py-modules = ["main", "notion_auth", "notion_form", "memory_bank", "ai_orchestrator", "ai_client"]
