@@ -96,7 +96,7 @@ JIRA_API_TOKEN=your-jira-api-token
 # AI Provider (gemini | openai | anthropic) — defaults to gemini
 AI_PROVIDER=gemini
 # Optional override; otherwise a sane per-provider default is used
-# AI_MODEL=gemini-2.0-flash
+# AI_MODEL=gemini-3.5-flash
 
 # Gemini (default)
 GEMINI_API_KEY=your-gemini-api-key
@@ -180,7 +180,7 @@ in `ai_client.py`. Pick one with `AI_PROVIDER` and supply the matching API key.
 
 | Provider    | `AI_PROVIDER` | Auth env                                  | Default model               | Install                                  |
 |-------------|---------------|-------------------------------------------|------------------------------|------------------------------------------|
-| Gemini      | `gemini`      | `GEMINI_API_KEY` *(or Vertex ADC)*        | `gemini-2.0-flash`           | included by default                       |
+| Gemini      | `gemini`      | `GEMINI_API_KEY` *(or Vertex ADC)*        | `gemini-3.5-flash`           | included by default                       |
 | OpenAI      | `openai`      | `OPENAI_API_KEY` *(opt. `OPENAI_BASE_URL`)* | `gpt-4o-mini`              | `pip install 'smart-logger[openai]'`     |
 | Anthropic   | `anthropic`   | `ANTHROPIC_API_KEY`                       | `claude-3-5-haiku-latest`    | `pip install 'smart-logger[anthropic]'`  |
 
@@ -200,6 +200,109 @@ smart-log notion-status
 
 # Logout (clear cached token)
 smart-log notion-logout
+```
+
+## Local Jira Cache
+
+Pull Jira tickets (with descriptions, comments, relationships, worklogs, attachment metadata) into a local SQLite store at `~/.smart-logger/jira_cache.db`. Use it for offline lookups, full-text search, and analytical reports — manually or via the MCP tools below.
+
+### Why
+
+- **Fast reads**: SQLite + FTS5 beats round-trips to Jira for repeated lookups.
+- **Stable surface**: Reports run against a known schema, not the live Jira API.
+- **Agent-friendly**: MCP tools let an agent sync, search, and reason over tickets without making the user re-run queries.
+
+### Commands
+
+```bash
+# Pull tickets — default: your work, last 180 days
+smart-log jira-sync
+
+# Scope to a project
+smart-log jira-sync --project GBI
+
+# Incremental sync from a date
+smart-log jira-sync --since 2025-01-01
+
+# Refresh a single ticket
+smart-log jira-sync --key GBI-645
+
+# Custom JQL (overrides other flags)
+smart-log jira-sync --jql 'project = GBI AND status != Done'
+
+# Skip per-ticket worklog calls (faster, but no time data)
+smart-log jira-sync --no-worklogs
+
+# Inspect cached ticket
+smart-log jira-show GBI-645
+smart-log jira-show GBI-645 --worklogs --no-comments
+
+# Full-text search (FTS5: phrases, AND/OR, NEAR/N, prefix*)
+smart-log jira-search "redis sentinel"
+smart-log jira-search "auth NEAR/5 oauth"
+smart-log jira-search "payment*"
+
+# Cache stats + analytical breakdown
+smart-log jira-stats
+smart-log jira-stats --project GBI --stale-days 21
+
+# Analytical reports (workload, daily plan, epic rollup, time spent, ...)
+smart-log jira-report digest --days 7
+smart-log jira-report daily
+smart-log jira-report epics --project GBI
+smart-log jira-report scope --field labels
+smart-log jira-report stale --days 21
+smart-log jira-report worklog --days 14
+```
+
+### Reports (`smart-log jira-report`)
+
+Single command, several "kinds". All offline, all scoped to `--mine` (current user) by default — pass `--all` for project-wide views.
+
+| Kind        | What it shows                                                                                       |
+|-------------|-----------------------------------------------------------------------------------------------------|
+| `digest`    | Workload overview — open totals, by status / priority / project / type, top priorities, recent activity, time spent in the last `--days` vs. the prior window. |
+| `daily`     | Focus list — In Progress, High/Highest queue, stale In Progress (idle ≥ 7d), blocked (status name contains "block" or has an inward "blocks" link). |
+| `epics`     | Group by `epic_key` with ticket count, done count, % complete, time invested, last activity. Epics not yet in cache show blank summaries — sync the epic key to fill them in. |
+| `scope`     | Distribution by `--field components` / `labels` / `fix_versions`. Useful for "where is my effort going". |
+| `stale`     | Tickets idle ≥ `--days`, ordered oldest first.                                                      |
+| `worklog`   | Time-spent breakdown — by date / project / top tickets in the last `--days`.                        |
+
+### What gets captured
+
+| Table | Contents |
+|-------|----------|
+| `tickets` | key, project, summary, description (raw + rendered), status, priority, type, assignee/reporter, parent, epic, labels, components, fix versions, sprint, story points, time tracking, timestamps, full raw JSON |
+| `comments` | id, author, body (raw + rendered), created/updated |
+| `links` | source/target keys, link type, direction (`outward`/`inward`), human label |
+| `worklogs` | id, author, seconds spent, started date, comment |
+| `attachments` | id, filename, mime, size, author, URL (metadata only — no binaries) |
+| `sync_runs` | audit trail of every sync execution |
+| `tickets_fts` | FTS5 index over summary + description + comments |
+
+Sync is **additive**: pulling a subset never deletes tickets outside the JQL scope. Comments / links / worklogs of *synced* tickets are replaced so edits and deletions inside Jira propagate.
+
+### MCP tools (agent usage)
+
+Run `python mcp_server.py` and the following tools become available to your agent:
+
+| Tool | Purpose |
+|------|---------|
+| `jira_sync_local` | Trigger a sync. Accepts `jql`, `project`, `since`, `key`, `only_mine`, `full`, `max_tickets`, `fetch_worklogs`. |
+| `jira_get_ticket_local` | Fetch a cached ticket as Markdown (description + comments + links + optional worklogs). |
+| `jira_search_local` | FTS5 search across the cache. |
+| `jira_local_stats` | Cache totals + status/assignee breakdown + stale tickets. |
+| `jira_relationships_local` | Local relationship graph for a ticket (`depth=1` direct, `depth=2` neighbors-of-neighbors). |
+| `jira_report_local` | Analytical reports: `digest`, `daily`, `epics`, `scope`, `stale`, `worklog`. Same surface as the CLI. |
+
+### Typical agent flow
+
+```text
+1. jira_sync_local(project="GBI", since="2025-01-01")
+2. jira_search_local("memory leak")
+3. jira_get_ticket_local("GBI-645", include_worklogs=true)
+4. jira_relationships_local("GBI-645", depth=2)
+5. jira_local_stats(project="GBI", stale_days=14)
 ```
 
 ## Task Type Classification
@@ -226,6 +329,10 @@ smart-logger/
 ├── memory_bank.py      # Persistent context/memory storage
 ├── notion_auth.py      # Playwright-based Notion authentication
 ├── notion_form.py      # Notion form submission via internal API
+├── jira_store.py       # Local Jira cache: SQLite schema + CRUD + FTS
+├── jira_sync.py        # Local Jira cache: pull from Jira API into the store
+├── jira_reports.py     # Local Jira cache: analytical queries
+├── mcp_server.py       # MCP server exposing tools to agents (incl. jira cache)
 ├── pyproject.toml      # Package config for global install
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Configuration template

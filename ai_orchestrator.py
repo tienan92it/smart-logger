@@ -242,96 +242,120 @@ Return ONLY JSON: {{"key": "...", "time_jira": "...", "time_hours": ..., "desc":
 
 def plan_task_query(user_input: str, context: str = "") -> dict:
     """
-    AI Agent plans the entire task query execution.
-    
-    Instead of rigid filter extraction, the AI:
-    1. Generates the JQL query directly
-    2. Decides how to display results
-    3. Specifies columns, grouping, sorting dynamically
-    
-    This is a more flexible, agentic approach.
+    AI Agent plans a task query as a structured filter object.
+
+    All reads are served by the **local Jira cache** (`jira_store.query_tickets`).
+    Live Jira API calls are reserved for `jira-sync` and worklog writes — so
+    this prompt deliberately produces filters (not JQL).
     """
     client = get_ai_client()
-    
+
     prompt = f"""
-You are an AI agent helping a user query their Jira tasks. Analyze their request and plan the execution.
+You are an AI agent helping a user query their cached Jira tickets. The data
+lives in a local SQLite cache that mirrors Jira; you do NOT generate JQL.
 
 User request: "{user_input}"
 
 {context}
 
-Your job is to:
-1. Generate the appropriate JQL query
-2. Decide the best way to display results
-3. Choose which columns to show
-4. Determine if grouping or special formatting is needed
+Your job is to produce a structured filter spec and a display plan.
 
-JQL SYNTAX GUIDE:
-- assignee = currentUser() - your tasks
-- project = "GBI" - filter by project
-- status = "In Progress" - filter by status
-- priority = High - filter by priority (Highest, High, Medium, Low, Lowest)
-- issuetype = Bug - filter by type
-- updated >= -1w - updated in last week
-- ORDER BY priority DESC - sort by priority (highest first)
-- ORDER BY updated DESC - sort by recently updated
-- ORDER BY status ASC - sort by status
-- ORDER BY created DESC - sort by creation date
+FILTER FIELDS (all optional, AND-combined):
+- project          single project key, e.g. "GBI"
+- projects         list of project keys when the user names several
+- status           list of exact Jira status names, e.g. ["In Progress", "Testing"]
+- status_category  list of status categories, e.g. ["In Progress"]
+- priority         list of priorities, e.g. ["Highest", "High"]
+- issue_type       list of issue types, e.g. ["Bug"]
+- assignee_self    true to restrict to the current user (default behavior)
+- reporter_self    true to restrict to tickets the current user reported
+- updated_after    "-1w" | "-7d" | "-1m" | "today" | "yesterday" | "YYYY-MM-DD"
+- updated_before   same forms as updated_after
+- created_after    same forms
+- labels           list of labels that must ALL be present
+- text_search      free-text query against summary + description + comments (FTS5)
+- open_only        true → exclude tickets whose status_category is "Done"
+- order_by         one of: "updated", "created", "resolved", "priority", "status", "key", "time_spent"
+- order_dir        "DESC" (default) or "ASC"
+- limit            integer, default 50
 
-DISPLAY OPTIONS:
-- format: "table" (standard table), "grouped" (group by a field), "compact" (minimal)
-- group_by: "project", "status", "priority", "type", or null
-- columns: array of columns to show, e.g. ["key", "summary", "status", "priority", "time_spent"]
-- show_time_spent: true if user wants to see logged time
+DISPLAY PLAN:
+- format: "table" (default) or "grouped"
+- group_by: "project" | "status" | "priority" | "type" | null
+- columns: subset of ["key", "summary", "status", "priority", "type", "assignee", "time_spent", "updated"]
+- show_time_spent: true if the user asked about logged time
 
-Think step by step:
-1. What is the user asking for?
-2. What JQL will get the right data?
-3. How should results be displayed to match their expectation?
+CONVENTIONS:
+- Default to `assignee_self: true` unless the user explicitly asks about
+  tickets they did NOT author / are not assigned.
+- For "in progress" use `status_category: ["In Progress"]` to also cover
+  Testing/Code Review-style sub-statuses.
+- For "open" or "not done" use `open_only: true`.
+- When the user references a project code (GBI, KFS, ...), set `project`.
+- "high priority" → `priority: ["Highest", "High"]`.
+- Use `text_search` for any free-text content match.
 
 Return ONLY valid JSON:
 {{
-  "reasoning": "Brief explanation of your understanding and plan",
-  "jql": "the JQL query string",
+  "reasoning": "one-line explanation",
+  "filters": {{
+    "project": null,
+    "projects": null,
+    "status": null,
+    "status_category": null,
+    "priority": null,
+    "issue_type": null,
+    "assignee_self": true,
+    "reporter_self": false,
+    "updated_after": null,
+    "updated_before": null,
+    "created_after": null,
+    "labels": null,
+    "text_search": null,
+    "open_only": false,
+    "order_by": "updated",
+    "order_dir": "DESC",
+    "limit": 50
+  }},
   "display": {{
-    "format": "table|grouped|compact",
-    "group_by": "field name or null",
+    "format": "table",
+    "group_by": null,
     "columns": ["key", "summary", "status", "priority"],
     "show_time_spent": false
   }}
 }}
 
 Examples:
-- "show my tasks order by priority" -> {{
-    "reasoning": "User wants their tasks sorted by priority, highest first",
-    "jql": "assignee = currentUser() ORDER BY priority DESC",
-    "display": {{"format": "table", "group_by": null, "columns": ["key", "summary", "status", "priority"], "show_time_spent": false}}
-  }}
-- "my GBI bugs grouped by status" -> {{
-    "reasoning": "User wants GBI project bugs, grouped by their status",
-    "jql": "assignee = currentUser() AND project = GBI AND issuetype = Bug ORDER BY status ASC",
-    "display": {{"format": "grouped", "group_by": "status", "columns": ["key", "summary", "priority"], "show_time_spent": false}}
-  }}
-- "in progress tasks with time spent" -> {{
-    "reasoning": "User wants in-progress tasks with time tracking info",
-    "jql": "assignee = currentUser() AND status = \\"In Progress\\" ORDER BY updated DESC",
+- "my in progress tasks with time spent" -> {{
+    "reasoning": "Active tickets owned by the user, include time logged.",
+    "filters": {{"assignee_self": true, "status_category": ["In Progress"], "order_by": "updated", "limit": 50}},
     "display": {{"format": "table", "group_by": null, "columns": ["key", "summary", "status", "time_spent"], "show_time_spent": true}}
   }}
-- "high priority tasks grouped by project" -> {{
-    "reasoning": "User wants high priority tasks organized by project",
-    "jql": "assignee = currentUser() AND priority in (Highest, High) ORDER BY priority DESC",
-    "display": {{"format": "grouped", "group_by": "project", "columns": ["key", "summary", "status", "priority"], "show_time_spent": false}}
+- "my GBI bugs grouped by status" -> {{
+    "reasoning": "GBI bugs assigned to me, grouped by status.",
+    "filters": {{"assignee_self": true, "project": "GBI", "issue_type": ["Bug"], "order_by": "status", "order_dir": "ASC", "limit": 100}},
+    "display": {{"format": "grouped", "group_by": "status", "columns": ["key", "summary", "priority"], "show_time_spent": false}}
+  }}
+- "high priority tasks updated last week" -> {{
+    "reasoning": "High/Highest priority tickets touched in the last 7 days.",
+    "filters": {{"assignee_self": true, "priority": ["Highest", "High"], "updated_after": "-1w", "order_by": "priority", "limit": 50}},
+    "display": {{"format": "table", "group_by": null, "columns": ["key", "summary", "status", "priority"], "show_time_spent": false}}
+  }}
+- "tickets about redis sentinel" -> {{
+    "reasoning": "Free-text search across the cache.",
+    "filters": {{"assignee_self": false, "text_search": "redis sentinel", "limit": 30}},
+    "display": {{"format": "table", "group_by": null, "columns": ["key", "summary", "status", "priority"], "show_time_spent": false}}
   }}
 """
-    
+
     raw = client.generate(prompt)
     clean_json = raw.replace('```json', '').replace('```', '').strip()
     return json.loads(clean_json)
 
 
-# Keep old function for backward compatibility but mark as deprecated
+# Backwards compatibility for callers that imported the old function name.
 def parse_task_query(user_input: str, context: str = "") -> dict:
-    """DEPRECATED: Use plan_task_query instead. This is kept for backward compatibility."""
+    """DEPRECATED: use plan_task_query."""
     return plan_task_query(user_input, context)
 
 

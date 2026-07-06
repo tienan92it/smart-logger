@@ -27,4 +27,16 @@ all = ["openai>=1.0.0", "anthropic>=0.34.0"]
 smart-log = "main:cli"
 
 [tool.setuptools]
-py-modules = ["main", "notion_auth", "notion_form", "notion_worklog", "memory_bank", "ai_orchestrator", "ai_client"]
+py-modules = [
+    "main",
+    "notion_auth",
+    "notion_form",
+    "notion_worklog",
+    "memory_bank",
+    "ai_orchestrator",
+    "ai_client",
+    "jira_store",
+    "jira_sync",
+    "jira_reports",
+    "mcp_server",
+]
