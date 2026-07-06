@@ -16,6 +16,8 @@ from notion_worklog import (
     NotionWorklogError,
     build_query_kwargs,
     period_to_date_range,
+    update_worklogs_status,
+    format_status_update_markdown,
 )
 from memory_bank import load_memory, save_memory, add_issue
 from ai_orchestrator import orchestrate, Intent, OrchestratorResult
@@ -38,7 +40,7 @@ def _dry_run_enabled() -> bool:
 _SUBCOMMAND_NAMES = frozenset(
     {
         "log", "tasks",
-        "notion-login", "notion-status", "notion-logout", "notion-worklogs",
+        "notion-login", "notion-status", "notion-logout", "notion-worklogs", "notion-worklog-status",
         "jira-sync", "jira-show", "jira-search", "jira-stats", "jira-report",
         "_smart_",
     }
@@ -635,6 +637,41 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
             intent=Intent.NOTION_WORKLOGS,
             message=f"Found {len(result['entries'])} entries, {total:g}h total",
         )
+
+    def notion_worklog_status_handler(plan: dict) -> OrchestratorResult:
+        """Handle notion_worklog_status intent — single entry or bulk by user/date/project."""
+        preview = _dry_run_enabled() or bool(plan.get("preview"))
+        try:
+            result = update_worklogs_status(
+                plan["status"],
+                entry_id=plan.get("entry_id"),
+                users=plan.get("users"),
+                project=plan.get("project"),
+                period=plan.get("period"),
+                since=plan.get("since"),
+                until=plan.get("until"),
+                from_status=plan.get("from_status"),
+                limit=int(plan.get("limit") or 500),
+                preview=preview,
+                quiet=True,
+            )
+        except NotionAuthError as e:
+            return OrchestratorResult(
+                success=False,
+                intent=Intent.NOTION_WORKLOG_STATUS,
+                message=f"Notion Auth Error: {e}. Run 'smart-log notion-login' to re-authenticate.",
+            )
+        except NotionWorklogError as e:
+            return OrchestratorResult(success=False, intent=Intent.NOTION_WORKLOG_STATUS, message=str(e))
+
+        _display_status_update_result(result)
+        if result.get("preview"):
+            msg = f"Preview: {result.get('matched', 0)} entries would be set to {result.get('status')}"
+        elif not result.get("updated"):
+            msg = "No matching entries to update."
+        else:
+            msg = f"Updated {len(result['updated'])} entries → {result['status']}"
+        return OrchestratorResult(success=True, intent=Intent.NOTION_WORKLOG_STATUS, message=msg)
     
     # Run orchestrator
     result = orchestrate(
@@ -644,6 +681,7 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
         task_detail_handler=task_detail_handler,
         work_summary_handler=work_summary_handler,
         notion_worklogs_handler=notion_worklogs_handler,
+        notion_worklog_status_handler=notion_worklog_status_handler,
     )
     
     # Handle clarify and help intents
@@ -1001,6 +1039,55 @@ def _display_notion_worklogs(result: dict) -> None:
     console.print(footer)
 
 
+def _display_status_update_result(result: dict) -> None:
+    """Render bulk or single Notion status update results."""
+    if result.get("preview"):
+        console.print(f"[bold cyan]Preview[/bold cyan] — {result.get('matched', 0)} entries would become [magenta]{result.get('status')}[/magenta]")
+    else:
+        console.print(
+            f"[bold green]Updated {len(result.get('updated') or [])} entries[/bold green] "
+            f"→ [magenta]{result.get('status')}[/magenta]"
+        )
+
+    skipped = result.get("skipped") or []
+    if skipped:
+        console.print(f"[dim]Skipped {len(skipped)} (already target status or --from filter)[/dim]")
+
+    if result.get("truncated"):
+        console.print("[yellow]Warning: query was truncated — narrow filters and retry if needed.[/yellow]")
+
+    rows = result.get("preview_rows") or result.get("updated") or []
+    if not rows:
+        if not skipped:
+            console.print("[yellow]No matching entries.[/yellow]")
+        return
+
+    table = Table(show_lines=False)
+    table.add_column("Date")
+    table.add_column("Project", style="green")
+    table.add_column("Created by", style="cyan")
+    table.add_column("Status", style="magenta")
+    table.add_column("Deliverables")
+
+    for row in rows[:25]:
+        deliverables = row.get("key_deliverables") or "-"
+        if len(deliverables) > 55:
+            deliverables = deliverables[:55] + "..."
+        prev = row.get("previous_status")
+        status_cell = row.get("status") or (f"{prev} → {result.get('status')}" if prev else result.get("status"))
+        table.add_row(
+            row.get("date") or "-",
+            row.get("project") or "-",
+            row.get("created_by") or "-",
+            status_cell or "-",
+            deliverables,
+        )
+
+    console.print(table)
+    if len(rows) > 25:
+        console.print(f"[dim]…and {len(rows) - 25} more[/dim]")
+
+
 @app.command("notion-worklogs")
 def notion_worklogs_cmd(
     user: Optional[List[str]] = typer.Option(
@@ -1055,6 +1142,70 @@ def notion_worklogs_cmd(
         return
 
     _display_notion_worklogs(result)
+
+
+@app.command("notion-worklog-status")
+def notion_worklog_status_cmd(
+    status: str = typer.Argument(..., help="Target status (Draft or Reviewed)"),
+    entry_id: Optional[str] = typer.Argument(
+        None, help="Optional single entry id (otherwise filter by user/date/project)"
+    ),
+    user: Optional[List[str]] = typer.Option(
+        None, "-u", "--user", help="Filter by user alias (NOTION_WORKLOG_USERS)"
+    ),
+    project: Optional[str] = typer.Option(None, "-p", "--project", help="Filter by Notion project"),
+    period: Optional[str] = typer.Option(
+        None,
+        "--period",
+        help="Date window: today, yesterday, this_week, last_week, this_month, last_month",
+    ),
+    since: Optional[str] = typer.Option(None, "--since", help="Include entries on/after YYYY-MM-DD"),
+    until: Optional[str] = typer.Option(None, "--until", help="Include entries on/before YYYY-MM-DD"),
+    from_status: Optional[str] = typer.Option(
+        None, "--from", help="Only update rows currently in this status (e.g. Draft)"
+    ),
+    preview: bool = typer.Option(False, "--preview", help="Show matches without updating"),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """
+    Update Status (Draft/Reviewed) on Notion worklog entries.
+
+    Examples:
+        smart-log notion-worklog-status Reviewed -u antran --period last_week
+        smart-log notion-worklog-status Reviewed -u "Thuần Thiên" --period today
+        smart-log notion-worklog-status Reviewed -p Kafi --since 2026-07-01 --from Draft
+        smart-log notion-worklog-status Reviewed 39364b29-b84c-8134-847c-ff4b60dd4f4f
+        smart-log notion-worklog-status Reviewed -u antran --period last_week --preview
+    """
+    if _dry_run_enabled():
+        preview = True
+
+    try:
+        result = update_worklogs_status(
+            status,
+            entry_id=entry_id,
+            users=user,
+            project=project,
+            period=period,
+            since=since,
+            until=until,
+            from_status=from_status,
+            preview=preview,
+            quiet=as_json,
+        )
+    except NotionAuthError as e:
+        console.print(f"[red]Notion Auth Error: {e}[/red]")
+        console.print("[yellow]Run 'smart-log notion-login' to re-authenticate.[/yellow]")
+        raise typer.Exit(1)
+    except NotionWorklogError as e:
+        console.print(f"[red]Notion worklog error: {e}[/red]")
+        raise typer.Exit(1)
+
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    _display_status_update_result(result)
 
 
 @app.command()

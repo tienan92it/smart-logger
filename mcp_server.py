@@ -23,13 +23,15 @@ from notion_worklog import (
     NotionWorklogError,
     build_query_kwargs,
     format_worklogs_markdown,
+    update_worklogs_status,
+    format_status_update_markdown,
 )
 from memory_bank import load_memory, save_memory, add_issue
 import jira_store
 import jira_reports
 
-# Load env vars
-load_dotenv()
+# Load env vars from project root (MCP spawn cwd may differ from this file)
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -66,10 +68,10 @@ def _format_seconds(seconds: int) -> str:
 @mcp.tool()
 def smart_log(instruction: str, project: Optional[str] = None) -> str:
     """
-    Log work, query tasks, get details, or fetch Notion worklogs using natural language.
+    Log work, query tasks, get details, fetch Notion worklogs, or update Notion worklog status using natural language.
     
     Args:
-        instruction: Natural language instruction (e.g. "2h on GBI-123", "my tasks", "show notion worklogs this week")
+        instruction: Natural language instruction (e.g. "2h on GBI-123", "show notion worklogs", "mark <id> as reviewed")
         project: Optional project code (e.g. "DF", "GBI") for logging work or Notion filters.
     """
     
@@ -295,6 +297,37 @@ def smart_log(instruction: str, project: Optional[str] = None) -> str:
             message=format_worklogs_markdown(result, max_rows=kwargs.get("limit") or 50),
         )
 
+    def notion_worklog_status_handler(plan: dict) -> OrchestratorResult:
+        """Update Status on one or many Notion worklog entries."""
+        try:
+            result = update_worklogs_status(
+                plan["status"],
+                entry_id=plan.get("entry_id"),
+                users=plan.get("users"),
+                project=plan.get("project") or project,
+                period=plan.get("period"),
+                since=plan.get("since"),
+                until=plan.get("until"),
+                from_status=plan.get("from_status"),
+                limit=int(plan.get("limit") or 500),
+                preview=bool(plan.get("preview")),
+                quiet=True,
+            )
+        except NotionAuthError as e:
+            return OrchestratorResult(
+                success=False,
+                intent=Intent.NOTION_WORKLOG_STATUS,
+                message=f"Notion Auth Error: {e}. Run 'smart-log notion-login' in terminal to re-authenticate.",
+            )
+        except NotionWorklogError as e:
+            return OrchestratorResult(success=False, intent=Intent.NOTION_WORKLOG_STATUS, message=str(e))
+
+        return OrchestratorResult(
+            success=True,
+            intent=Intent.NOTION_WORKLOG_STATUS,
+            message=format_status_update_markdown(result),
+        )
+
     # Run orchestrator
     result = orchestrate(
         user_input=instruction,
@@ -303,6 +336,7 @@ def smart_log(instruction: str, project: Optional[str] = None) -> str:
         task_detail_handler=task_detail_handler,
         work_summary_handler=work_summary_handler,
         notion_worklogs_handler=notion_worklogs_handler,
+        notion_worklog_status_handler=notion_worklog_status_handler,
     )
     
     return result.message
@@ -721,6 +755,58 @@ def notion_worklogs_local(
         return f"Notion worklog error: {e}"
 
     return format_worklogs_markdown(result, max_rows=kwargs.get("limit") or 50)
+
+
+@mcp.tool()
+def notion_worklog_set_status(
+    status: str,
+    entry_id: Optional[str] = None,
+    users: Optional[List[str]] = None,
+    project: Optional[str] = None,
+    period: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    from_status: Optional[str] = None,
+    preview: bool = False,
+    limit: int = 500,
+) -> str:
+    """
+    Update Status (Draft/Reviewed) on Notion worklog entries.
+
+    Target rows by entry_id OR by user/project/date filters (date scope required for bulk).
+
+    Args:
+        status: Target status — Draft or Reviewed.
+        entry_id: Optional single Notion block/page UUID.
+        users: User aliases from NOTION_WORKLOG_USERS (e.g. ["antran", "Thuần Thiên"]).
+        project: Notion project name (e.g. "Kafi", "DF").
+        period: today, yesterday, this_week, last_week, this_month, last_month.
+        since: Include entries on/after YYYY-MM-DD.
+        until: Include entries on/before YYYY-MM-DD.
+        from_status: Only update rows currently in this status (e.g. Draft).
+        preview: If true, list matches without saving changes.
+        limit: Max rows to consider (default 500).
+    """
+    try:
+        result = update_worklogs_status(
+            status,
+            entry_id=entry_id,
+            users=users,
+            project=project,
+            period=period,
+            since=since,
+            until=until,
+            from_status=from_status,
+            preview=preview,
+            limit=limit,
+            quiet=True,
+        )
+    except NotionAuthError as e:
+        return f"Notion Auth Error: {e}. Run 'smart-log notion-login' in terminal to re-authenticate."
+    except NotionWorklogError as e:
+        return f"Notion worklog error: {e}"
+
+    return format_status_update_markdown(result)
 
 
 if __name__ == "__main__":

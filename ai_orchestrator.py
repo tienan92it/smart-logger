@@ -11,13 +11,14 @@ Central intelligence that:
 import os
 import json
 import re
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 from dataclasses import dataclass
 from enum import Enum
 from dotenv import load_dotenv
 from rich.console import Console
 
 from ai_client import get_ai_client
+from notion_worklog import detect_period_in_text, match_users_in_text
 from memory_bank import (
     load_memory,
     save_memory,
@@ -39,6 +40,7 @@ class Intent(Enum):
     TASK_DETAIL = "task_detail"
     WORK_SUMMARY = "work_summary"  # Summary/report of Jira worklogs (local cache)
     NOTION_WORKLOGS = "notion_worklogs"  # Read Notion time-tracking entries
+    NOTION_WORKLOG_STATUS = "notion_worklog_status"  # Update Notion worklog status
     HELP = "help"
     CLARIFY = "clarify"
 
@@ -85,11 +87,14 @@ Classify into ONE of these intents:
 
 5. "notion_worklogs" - User wants to READ/VIEW time entries from NOTION (the time-tracking database). MUST mention Notion OR clearly refer to the Notion logtime table (not Jira). Keywords: "notion worklogs", "notion time", "notion logs", "logtime in notion", "who logged on Kafi in notion".
    Extract: users (list of display names, or null for authenticated user), project (Notion project name like "Kafi" or "DF"), period (same values as work_summary), limit (optional integer, default 50)
+
+6. "notion_worklog_status" - User wants to UPDATE the Status field on Notion worklog entries (Draft ↔ Reviewed). Can target one entry UUID OR bulk-filter by user/project/date. Keywords: "mark as reviewed", "update all worklogs of antran last week to Reviewed", "change Thuan Thien logs today to Reviewed".
+   Extract: status ("Draft" or "Reviewed"), entry_id (optional UUID), users (optional list of names), project (optional Notion project name), period (today/yesterday/this_week/last_week/this_month/last_month), from_status (optional, e.g. only update Draft rows when setting Reviewed)
    
-6. "help" - User is asking how to use the tool or what it can do.
+7. "help" - User is asking how to use the tool or what it can do.
    Extract: nothing
    
-7. "clarify" - Input is ambiguous or doesn't fit other categories. Need more information.
+8. "clarify" - Input is ambiguous or doesn't fit other categories. Need more information.
    Extract: clarification_message (what to ask the user)
 
 IMPORTANT RULES:
@@ -98,6 +103,7 @@ IMPORTANT RULES:
 - Just an issue key with "what is" or "details" = "task_detail"
 - "summary", "report", "my work last week/month" WITHOUT "notion" = "work_summary"
 - Any request to view/read Notion time entries or Notion worklogs = "notion_worklogs"
+- Any request to change Notion worklog status (Draft/Reviewed) with an entry UUID = "notion_worklog_status"
 - If unsure between work_summary and notion_worklogs, check for "notion"
 
 Return ONLY valid JSON:
@@ -113,6 +119,9 @@ Examples:
 - "how much did I work on GBI last week" -> {{"intent": "work_summary", "confidence": 0.9, "extracted_data": {{"period": "last_week", "project": "GBI"}}, "message": null}}
 - "show my notion worklogs this week" -> {{"intent": "notion_worklogs", "confidence": 0.95, "extracted_data": {{"period": "this_week", "project": null, "users": null, "limit": 50}}, "message": null}}
 - "notion time for antran and Thuần Thiên on Kafi" -> {{"intent": "notion_worklogs", "confidence": 0.95, "extracted_data": {{"period": null, "project": "Kafi", "users": ["antran", "Thuần Thiên"], "limit": 50}}, "message": null}}
+- "mark 39364b29-b84c-8134-847c-ff4b60dd4f4f as reviewed in notion" -> {{"intent": "notion_worklog_status", "confidence": 0.95, "extracted_data": {{"entry_id": "39364b29-b84c-8134-847c-ff4b60dd4f4f", "status": "Reviewed"}}, "message": null}}
+- "update all worklogs of antran last week to Reviewed" -> {{"intent": "notion_worklog_status", "confidence": 0.95, "extracted_data": {{"status": "Reviewed", "users": ["antran"], "period": "last_week", "from_status": "Draft", "entry_id": null, "project": null}}, "message": null}}
+- "change status of Thuần Thiên notion logs today to Reviewed" -> {{"intent": "notion_worklog_status", "confidence": 0.95, "extracted_data": {{"status": "Reviewed", "users": ["Thuần Thiên"], "period": "today", "from_status": "Draft", "entry_id": null, "project": null}}, "message": null}}
 - "help" -> {{"intent": "help", "confidence": 1.0, "extracted_data": {{}}, "message": null}}
 - "GBI-123" -> {{"intent": "clarify", "confidence": 0.5, "extracted_data": {{"issue_key": "GBI-123"}}, "message": "Did you want to log time on GBI-123, see its details, or something else?"}}
 """
@@ -149,8 +158,39 @@ def _fallback_classification(user_input: str) -> ClassificationResult:
             message=None,
         )
     
+    # Check for Notion worklog status update (before read patterns)
+    uuid_match = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        user_input,
+        re.IGNORECASE,
+    )
+    status_value = None
+    if "reviewed" in text:
+        status_value = "Reviewed"
+    elif "draft" in text:
+        status_value = "Draft"
+    if status_value and any(
+        kw in text for kw in ("status", "mark", "set", "update", "change", "review")
+    ):
+        users = match_users_in_text(user_input)
+        period = detect_period_in_text(user_input)
+        if uuid_match or users or period or "notion" in text or "worklog" in text:
+            return ClassificationResult(
+                intent=Intent.NOTION_WORKLOG_STATUS,
+                confidence=0.8,
+                extracted_data={
+                    "entry_id": uuid_match.group(0) if uuid_match else None,
+                    "status": status_value,
+                    "users": users or None,
+                    "period": period,
+                    "project": None,
+                    "from_status": "Draft" if status_value == "Reviewed" else None,
+                },
+                message=None,
+            )
+
     # Check for Notion worklog read patterns (before generic work summary)
-    if "notion" in text and any(
+    if "notion" in text and uuid_match is None and any(
         kw in text
         for kw in ("worklog", "logtime", "time log", "time entry", "time entries", "logged", "hours", "effort")
     ):
@@ -407,6 +447,7 @@ def orchestrate(
     task_detail_handler: Optional[Callable] = None,
     work_summary_handler: Optional[Callable] = None,
     notion_worklogs_handler: Optional[Callable] = None,
+    notion_worklog_status_handler: Optional[Callable[[dict], OrchestratorResult]] = None,
 ) -> OrchestratorResult:
     """
     Main orchestrator entry point.
@@ -423,6 +464,7 @@ def orchestrate(
         task_detail_handler: Function to call for task details
         work_summary_handler: Function to call for work summary/reports
         notion_worklogs_handler: Function to call for Notion time-entry queries
+        notion_worklog_status_handler: Function to call for Notion worklog status updates
     """
     # 1. Load memory and build context
     memory = load_memory()
@@ -539,6 +581,45 @@ def orchestrate(
                 intent=classification.intent,
                 message="Notion worklogs handler not configured",
             )
+
+    elif classification.intent == Intent.NOTION_WORKLOG_STATUS:
+        if notion_worklog_status_handler:
+            extracted = classification.extracted_data or {}
+            status = extracted.get("status")
+            if not status:
+                result = OrchestratorResult(
+                    success=False,
+                    intent=classification.intent,
+                    message="Need a target status (Draft or Reviewed).",
+                )
+            elif not extracted.get("entry_id") and not (
+                extracted.get("period")
+                or extracted.get("since")
+                or extracted.get("until")
+            ):
+                result = OrchestratorResult(
+                    success=False,
+                    intent=classification.intent,
+                    message=(
+                        "Need a date scope (e.g. last week, today) or a Notion entry id. "
+                        "Example: 'update all worklogs of antran last week to Reviewed'."
+                    ),
+                )
+            else:
+                try:
+                    result = notion_worklog_status_handler(extracted)
+                except Exception as e:
+                    result = OrchestratorResult(
+                        success=False,
+                        intent=classification.intent,
+                        message=f"Failed to update Notion worklog status: {e}",
+                    )
+        else:
+            result = OrchestratorResult(
+                success=False,
+                intent=classification.intent,
+                message="Notion worklog status handler not configured",
+            )
     
     elif classification.intent == Intent.HELP:
         result = OrchestratorResult(
@@ -597,10 +678,16 @@ Examples:
     "notion time for antran on Kafi"
     "who logged on Kafi in notion last week"
 
+  Notion worklog status:
+    "update all worklogs of antran last week to Reviewed"
+    "change Thuần Thiên notion logs today to Reviewed"
+    "mark <entry-id> as reviewed"
+
 Commands:
   log         - Explicitly log work (e.g., log "2h on GBI-123")
   tasks       - Explicitly query tasks
   notion-worklogs - Fetch Notion time entries
+  notion-worklog-status - Update Notion entry status (Draft/Reviewed)
   notion-login - Login to Notion
   notion-status - Show Notion status
 """.strip()

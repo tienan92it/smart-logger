@@ -11,6 +11,7 @@ import json
 import os
 import time
 import random
+import uuid
 from datetime import datetime
 from typing import Any, Optional
 
@@ -29,6 +30,7 @@ from notion_form import NotionAuthError, get_project_page_id
 console = Console()
 
 NOTION_QUERY_URL = "https://app.notion.com/api/v3/queryCollection"
+NOTION_SAVE_URL = "https://app.notion.com/api/v3/saveTransactionsFanout"
 NOTION_CLIENT_VERSION = "23.13.20260706.0619"
 _MAX_FETCH_LIMIT = 500
 _MAX_TRANSIENT_ATTEMPTS = 5
@@ -50,6 +52,38 @@ def _prop_ids() -> dict[str, str]:
         "created_by_filter": os.getenv("NOTION_PROP_ID_CREATED_BY", "nlOG"),
         "created_by": os.getenv("NOTION_PROP_ID_CREATED_BY_VALUE", "nWkE"),
     }
+
+
+def _space_id() -> str:
+    space_id = os.getenv("NOTION_SPACE_ID")
+    if not space_id:
+        raise NotionWorklogError("Missing NOTION_SPACE_ID in .env file.")
+    return space_id
+
+
+def _allowed_statuses() -> tuple[str, ...]:
+    raw = os.getenv("NOTION_WORKLOG_STATUSES")
+    if raw:
+        try:
+            values = json.loads(raw)
+            if isinstance(values, list) and values:
+                return tuple(str(v) for v in values)
+        except json.JSONDecodeError:
+            pass
+    return ("Draft", "Reviewed")
+
+
+def normalize_worklog_status(status: str) -> str:
+    """Return canonical status label (case-insensitive match)."""
+    cleaned = (status or "").strip()
+    if not cleaned:
+        raise NotionWorklogError("Status must not be empty.")
+    for allowed in _allowed_statuses():
+        if cleaned.lower() == allowed.lower():
+            return allowed
+    raise NotionWorklogError(
+        f"Invalid status '{status}'. Allowed: {', '.join(_allowed_statuses())}"
+    )
 
 
 def _collection_id() -> str:
@@ -220,10 +254,7 @@ def _query_collection_raw(
     fetch_limit: int,
     retry_on_auth_fail: bool = True,
 ) -> dict[str, Any]:
-    space_id = os.getenv("NOTION_SPACE_ID")
-    if not space_id:
-        raise NotionWorklogError("Missing NOTION_SPACE_ID in .env file.")
-
+    space_id = _space_id()
     prop = _prop_ids()
     payload = {
         "clientType": "notion_app",
@@ -581,6 +612,91 @@ def build_query_kwargs(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def detect_period_in_text(text: str) -> Optional[str]:
+    """Best-effort period shorthand from natural language."""
+    normalized = text.lower().replace("_", " ").replace("-", " ")
+    compact = normalized.replace(" ", "")
+    if "today" in normalized:
+        return "today"
+    if "yesterday" in normalized:
+        return "yesterday"
+    if "this week" in normalized or "thisweek" in compact:
+        return "this_week"
+    if "last week" in normalized or "lastweek" in compact:
+        return "last_week"
+    if "this month" in normalized or "thismonth" in compact:
+        return "this_month"
+    if "last month" in normalized or "lastmonth" in compact:
+        return "last_month"
+    return None
+
+
+def match_users_in_text(text: str) -> list[str]:
+    """Match NOTION_WORKLOG_USERS aliases mentioned in free text."""
+    needle = text.lower()
+    matched: list[str] = []
+    for alias in _load_user_directory():
+        if alias.lower() in {"me", "self"}:
+            continue
+        if alias.lower() in needle:
+            matched.append(alias)
+    return matched
+
+
+def build_status_update_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Normalize orchestrator/CLI plan for status updates."""
+    query = build_query_kwargs(plan)
+    status = plan.get("status")
+    from_status = plan.get("from_status")
+    if from_status:
+        from_status = normalize_worklog_status(from_status)
+    return {
+        "entry_id": (plan.get("entry_id") or "").strip() or None,
+        "status": normalize_worklog_status(status) if status else None,
+        "users": query.get("users"),
+        "project": query.get("project"),
+        "since": query.get("since"),
+        "until": query.get("until"),
+        "from_status": from_status,
+        "limit": int(plan.get("limit") or 500),
+        "preview": bool(plan.get("preview", False)),
+    }
+
+
+def format_status_update_markdown(result: dict[str, Any]) -> str:
+    """Summarize a bulk/single status update for MCP output."""
+    if result.get("preview"):
+        lines = [f"**Preview — {result.get('matched', 0)} matching entries** (no changes made)"]
+    else:
+        lines = [
+            f"**Updated {len(result.get('updated') or [])} entries → {result.get('status')}**"
+        ]
+    skipped = result.get("skipped") or []
+    if skipped:
+        lines.append(f"_Skipped {len(skipped)} (already {result.get('status')} or filtered out)._")
+    if result.get("truncated"):
+        lines.append("_Warning: query was truncated — narrow filters or run again._")
+
+    updated = result.get("updated") or []
+    preview_rows = result.get("preview_rows") or updated
+    rows = preview_rows[:20]
+    if rows:
+        lines.extend(["", "| Date | Project | Created by | Status | Deliverables |", "|---|---|---|---|---|"])
+        for row in rows:
+            deliverables = (row.get("key_deliverables") or "-").replace("|", "\\|")
+            if len(deliverables) > 60:
+                deliverables = deliverables[:60] + "..."
+            lines.append(
+                f"| {row.get('date') or '-'} | {row.get('project') or '-'} | "
+                f"{row.get('created_by') or '-'} | {row.get('status') or '-'} | {deliverables} |"
+            )
+        if len(preview_rows) > len(rows):
+            lines.append(f"\n_…and {len(preview_rows) - len(rows)} more._")
+    elif not skipped:
+        lines.append("\n_No matching entries._")
+    return "\n".join(lines)
+
+
 def format_worklogs_markdown(result: dict[str, Any], max_rows: int = 50) -> str:
     """Format query result as a Markdown table for MCP / agent output."""
     entries = result.get("entries") or []
@@ -610,3 +726,363 @@ def format_worklogs_markdown(result: dict[str, Any], max_rows: int = 50) -> str:
     if result.get("truncated"):
         lines.append("_Results may be truncated — narrow filters or raise limit._")
     return "\n".join(lines)
+
+
+def _build_status_update_transaction(
+    entry_id: str,
+    status: str,
+    *,
+    space_id: str,
+    user_id: str,
+    status_prop: str,
+) -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    pointer = {"id": entry_id, "table": "block", "spaceId": space_id}
+    return {
+        "id": str(uuid.uuid4()),
+        "spaceId": space_id,
+        "debug": {"userAction": "smart-logger.updateWorklogStatus"},
+        "operations": [
+            {
+                "command": "updateBlockPropertyValue",
+                "pointer": pointer,
+                "path": ["properties", status_prop],
+                "args": {"primitiveOp": {"command": "set", "args": [[status]]}},
+                "additionalUpdatedPointers": [pointer],
+            },
+            {
+                "command": "update",
+                "pointer": pointer,
+                "path": [],
+                "args": {
+                    "last_edited_time": now_ms,
+                    "last_edited_by_id": user_id,
+                    "last_edited_by_table": "notion_user",
+                },
+            },
+        ],
+    }
+
+
+def _post_save_transactions(
+    transactions: list[dict[str, Any]],
+    creds: dict,
+    *,
+    quiet: bool = False,
+    retry_on_auth_fail: bool = True,
+    retry_callback: Optional[Any] = None,
+) -> dict[str, Any]:
+    if not transactions:
+        raise NotionWorklogError("No transactions to save.")
+
+    space_id = _space_id()
+    payload = {"requestId": str(uuid.uuid4()), "transactions": transactions}
+    headers = _request_headers(creds, space_id)
+    cookies = _request_cookies(creds)
+
+    for attempt in range(_MAX_TRANSIENT_ATTEMPTS):
+        response = requests.post(
+            NOTION_SAVE_URL,
+            json=payload,
+            headers=headers,
+            cookies=cookies,
+            timeout=60,
+        )
+
+        if response.status_code == 401 or "Unauthorized" in response.text:
+            if retry_on_auth_fail and retry_callback:
+                if not quiet:
+                    console.print("[yellow]Token expired. Re-authenticating...[/yellow]")
+                clear_token()
+                email = os.getenv("NOTION_EMAIL")
+                new_creds = get_token_via_playwright(email)
+                save_token(new_creds)
+                return retry_callback(new_creds)
+            raise NotionAuthError(
+                "Authentication failed. Run 'smart-log notion-login' to re-authenticate."
+            )
+
+        if response.ok:
+            try:
+                return response.json()
+            except (json.JSONDecodeError, ValueError):
+                return {}
+
+        if _notion_response_retryable(response) and attempt < _MAX_TRANSIENT_ATTEMPTS - 1:
+            delay = min(30.0, (2 ** (attempt + 1)) + random.uniform(0, 1.0))
+            if not quiet:
+                console.print(
+                    f"[yellow]Notion temporarily unavailable ({response.status_code}), "
+                    f"retrying in {delay:.1f}s...[/yellow]"
+                )
+            time.sleep(delay)
+            continue
+
+        raise NotionWorklogError(
+            f"saveTransactionsFanout failed ({response.status_code}): {response.text[:500]}"
+        )
+
+    raise NotionWorklogError("saveTransactionsFanout failed after retries.")
+
+
+def _entry_matches_status_filter(entry: dict[str, Any], target: str, from_status: Optional[str]) -> tuple[bool, str]:
+    current = (entry.get("status") or "-").strip()
+    if current.lower() == target.lower():
+        return False, f"already {target}"
+    if from_status and current.lower() != from_status.lower():
+        return False, f"status is {current}, not {from_status}"
+    return True, ""
+
+
+def update_worklogs_status(
+    status: str,
+    *,
+    entry_id: Optional[str] = None,
+    users: Optional[list[str]] = None,
+    project: Optional[str] = None,
+    period: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    from_status: Optional[str] = None,
+    limit: int = 500,
+    preview: bool = False,
+    quiet: bool = False,
+    retry_on_auth_fail: bool = True,
+) -> dict[str, Any]:
+    """
+    Update one or many Notion worklog rows to `status`.
+
+    Identify rows by:
+    - `entry_id` alone, or
+    - filters: users / project / period / since / until (at least one date scope required)
+    """
+    canonical_status = normalize_worklog_status(status)
+    canonical_from = normalize_worklog_status(from_status) if from_status else None
+
+    plan = {
+        "status": canonical_status,
+        "entry_id": entry_id,
+        "users": users,
+        "project": project,
+        "period": period,
+        "since": since,
+        "until": until,
+        "from_status": canonical_from,
+        "limit": limit,
+        "preview": preview,
+    }
+    normalized = build_status_update_plan(plan)
+
+    if normalized["entry_id"]:
+        if preview:
+            return {
+                "status": canonical_status,
+                "preview": True,
+                "matched": 1,
+                "updated": [],
+                "skipped": [],
+                "preview_rows": [{"id": normalized["entry_id"], "status": "?"}],
+                "truncated": False,
+            }
+        single = update_worklog_status(
+            normalized["entry_id"],
+            canonical_status,
+            quiet=quiet,
+            retry_on_auth_fail=retry_on_auth_fail,
+        )
+        return {
+            "status": canonical_status,
+            "preview": False,
+            "matched": 1,
+            "updated": [single],
+            "skipped": [],
+            "truncated": False,
+        }
+
+    if not normalized["since"] and not normalized["until"]:
+        raise NotionWorklogError(
+            "Bulk status updates need a date scope: use --period, --since/--until, "
+            "or pass a single entry id."
+        )
+
+    query_result = query_worklogs(
+        users=normalized["users"],
+        project=normalized["project"],
+        since=normalized["since"],
+        until=normalized["until"],
+        limit=normalized["limit"],
+        quiet=True,
+    )
+    entries = query_result.get("entries") or []
+
+    to_update: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for entry in entries:
+        ok, reason = _entry_matches_status_filter(entry, canonical_status, canonical_from)
+        if ok:
+            to_update.append(entry)
+        else:
+            skipped.append({**entry, "skip_reason": reason})
+
+    preview_rows = to_update if preview else []
+    if preview:
+        return {
+            "status": canonical_status,
+            "preview": True,
+            "matched": len(to_update),
+            "updated": [],
+            "skipped": skipped,
+            "preview_rows": preview_rows,
+            "truncated": bool(query_result.get("truncated")),
+            "filters": {
+                "users": normalized["users"],
+                "project": normalized["project"],
+                "since": normalized["since"],
+                "until": normalized["until"],
+                "from_status": canonical_from,
+            },
+        }
+
+    if not to_update:
+        return {
+            "status": canonical_status,
+            "preview": False,
+            "matched": 0,
+            "updated": [],
+            "skipped": skipped,
+            "truncated": bool(query_result.get("truncated")),
+        }
+
+    space_id = _space_id()
+    prop = _prop_ids()
+    creds = get_notion_credentials(quiet=quiet)
+    user_id = creds.get("user_id")
+    if not user_id:
+        raise NotionAuthError("Missing user_id in stored Notion session.")
+
+    transactions = [
+        _build_status_update_transaction(
+            entry["id"],
+            canonical_status,
+            space_id=space_id,
+            user_id=user_id,
+            status_prop=prop["status"],
+        )
+        for entry in to_update
+    ]
+
+    def _retry(new_creds: dict) -> dict[str, Any]:
+        return update_worklogs_status(
+            canonical_status,
+            entry_id=entry_id,
+            users=users,
+            project=project,
+            period=period,
+            since=since,
+            until=until,
+            from_status=from_status,
+            limit=limit,
+            preview=False,
+            quiet=quiet,
+            retry_on_auth_fail=False,
+        )
+
+    _post_save_transactions(
+        transactions,
+        creds,
+        quiet=quiet,
+        retry_on_auth_fail=retry_on_auth_fail,
+        retry_callback=_retry,
+    )
+
+    updated = [
+        {
+            "entry_id": entry["id"],
+            "status": canonical_status,
+            "previous_status": entry.get("status"),
+            "date": entry.get("date"),
+            "project": entry.get("project"),
+            "created_by": entry.get("created_by"),
+            "key_deliverables": entry.get("key_deliverables"),
+        }
+        for entry in to_update
+    ]
+    return {
+        "status": canonical_status,
+        "preview": False,
+        "matched": len(to_update),
+        "updated": updated,
+        "skipped": skipped,
+        "truncated": bool(query_result.get("truncated")),
+        "filters": {
+            "users": normalized["users"],
+            "project": normalized["project"],
+            "since": normalized["since"],
+            "until": normalized["until"],
+            "from_status": canonical_from,
+        },
+    }
+
+
+def update_worklog_status(
+    entry_id: str,
+    status: str,
+    *,
+    quiet: bool = False,
+    retry_on_auth_fail: bool = True,
+) -> dict[str, Any]:
+    """
+    Update a Notion worklog row status via saveTransactionsFanout.
+
+    Args:
+        entry_id: Notion block/page id (from `notion-worklogs --json`).
+        status: Target status label (e.g. Draft, Reviewed).
+
+    Returns:
+        API response dict (typically empty on success).
+    """
+    entry_id = entry_id.strip()
+    if not entry_id:
+        raise NotionWorklogError("entry_id is required.")
+
+    canonical_status = normalize_worklog_status(status)
+    space_id = _space_id()
+    prop = _prop_ids()
+    creds = get_notion_credentials(quiet=quiet)
+    user_id = creds.get("user_id")
+    if not user_id:
+        raise NotionAuthError("Missing user_id in stored Notion session.")
+
+    payload = {
+        "requestId": str(uuid.uuid4()),
+        "transactions": [
+            _build_status_update_transaction(
+                entry_id,
+                canonical_status,
+                space_id=space_id,
+                user_id=user_id,
+                status_prop=prop["status"],
+            )
+        ],
+    }
+
+    def _retry(_new_creds: dict) -> dict[str, Any]:
+        return update_worklog_status(
+            entry_id,
+            canonical_status,
+            quiet=quiet,
+            retry_on_auth_fail=False,
+        )
+
+    _post_save_transactions(
+        payload["transactions"],
+        creds,
+        quiet=quiet,
+        retry_on_auth_fail=retry_on_auth_fail,
+        retry_callback=_retry,
+    )
+    return {
+        "entry_id": entry_id,
+        "status": canonical_status,
+        "response": {},
+    }
