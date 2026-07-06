@@ -147,12 +147,13 @@ def get_token_via_playwright(email: Optional[str] = None) -> dict:
     return token_data
 
 
-def get_notion_credentials(force_login: bool = False) -> dict:
+def get_notion_credentials(force_login: bool = False, quiet: bool = False) -> dict:
     """
     Get Notion credentials, using cached token if available.
     
     Args:
         force_login: If True, ignore cached token and force new login.
+        quiet: If True, suppress informational console output.
     
     Returns:
         dict with 'token_v2' and 'user_id'
@@ -161,7 +162,8 @@ def get_notion_credentials(force_login: bool = False) -> dict:
         # Try to load stored token
         stored = load_stored_token()
         if stored and stored.get("token_v2"):
-            console.print("[dim]Using cached Notion token.[/dim]")
+            if not quiet:
+                console.print("[dim]Using cached Notion token.[/dim]")
             return stored
     
     # Need to login

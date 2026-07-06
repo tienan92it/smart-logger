@@ -11,6 +11,7 @@ from ai_client import get_ai_client
 
 from notion_form import submit_notion_form, NotionFormError, NotionAuthError
 from notion_auth import get_notion_credentials, clear_token, load_stored_token
+from notion_worklog import query_worklogs, NotionWorklogError
 from memory_bank import load_memory, save_memory, add_issue
 from ai_orchestrator import orchestrate, Intent, OrchestratorResult
 
@@ -30,7 +31,7 @@ def _dry_run_enabled() -> bool:
 
 # CLI subcommand names (hyphenated). Used so Typer does not treat them as bare NLP.
 _SUBCOMMAND_NAMES = frozenset(
-    {"log", "tasks", "notion-login", "notion-status", "notion-logout", "_smart_"}
+    {"log", "tasks", "notion-login", "notion-status", "notion-logout", "notion-worklogs", "_smart_"}
 )
 
 
@@ -901,6 +902,97 @@ def notion_logout():
     """
     clear_token()
     console.print("[green]✔ Logged out from Notion.[/green]")
+
+
+@app.command("notion-worklogs")
+def notion_worklogs_cmd(
+    user: Optional[List[str]] = typer.Option(
+        None,
+        "--user",
+        "-u",
+        help="Filter by user name/alias (NOTION_WORKLOG_USERS). Defaults to authenticated user.",
+    ),
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Filter by Notion project name (NOTION_PROJECT_* mapping).",
+    ),
+    limit: int = typer.Option(50, "--limit", "-n", help="Maximum rows to show"),
+    since: Optional[str] = typer.Option(
+        None, "--since", help="Include entries on/after YYYY-MM-DD"
+    ),
+    until: Optional[str] = typer.Option(
+        None, "--until", help="Include entries on/before YYYY-MM-DD"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
+):
+    """
+    Fetch worklog entries from the Notion time-tracking database.
+
+    Examples:
+        smart-log notion-worklogs
+        smart-log notion-worklogs -u antran -u "Thuần Thiên"
+        smart-log notion-worklogs -p Kafi --since 2026-07-01
+        smart-log notion-worklogs --json -n 100
+    """
+    try:
+        result = query_worklogs(
+            users=user,
+            project=project,
+            limit=limit,
+            since=since,
+            until=until,
+            quiet=as_json,
+        )
+    except NotionAuthError as e:
+        console.print(f"[red]Notion Auth Error: {e}[/red]")
+        console.print("[yellow]Run 'smart-log notion-login' to re-authenticate.[/yellow]")
+        raise typer.Exit(1)
+    except NotionWorklogError as e:
+        console.print(f"[red]Notion worklog error: {e}[/red]")
+        raise typer.Exit(1)
+
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    entries = result["entries"]
+    if not entries:
+        console.print("[yellow]No worklog entries found for the given filters.[/yellow]")
+        return
+
+    table = Table(title="Notion Worklogs", show_lines=True)
+    table.add_column("Created by", style="cyan", no_wrap=True)
+    table.add_column("Project", style="green", no_wrap=True)
+    table.add_column("Date", no_wrap=True)
+    table.add_column("Status", style="magenta")
+    table.add_column("Effort", justify="right", style="yellow")
+    table.add_column("Focus", style="blue")
+    table.add_column("Key deliverables", style="white")
+
+    for row in entries:
+        effort = row.get("effort_hours")
+        effort_str = f"{effort:g}h" if effort is not None else "-"
+        deliverables = row.get("key_deliverables") or "-"
+        if len(deliverables) > 70:
+            deliverables = deliverables[:70] + "..."
+        table.add_row(
+            row.get("created_by") or "-",
+            row.get("project") or "-",
+            row.get("date") or "-",
+            row.get("status") or "-",
+            effort_str,
+            row.get("focus_areas") or "-",
+            deliverables,
+        )
+
+    console.print(table)
+    total = result.get("total_effort_hours") or 0
+    footer = f"[dim]Showing {len(entries)} entries · total effort {total:g}h[/dim]"
+    if result.get("truncated"):
+        footer += " · [yellow]results may be truncated (increase --limit or narrow filters)[/yellow]"
+    console.print(footer)
 
 
 @app.command()
