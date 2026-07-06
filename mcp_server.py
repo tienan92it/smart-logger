@@ -18,6 +18,12 @@ from main import (
     _current_user_email,
 )
 from notion_form import submit_notion_form, NotionAuthError, NotionFormError
+from notion_worklog import (
+    query_worklogs,
+    NotionWorklogError,
+    build_query_kwargs,
+    format_worklogs_markdown,
+)
 from memory_bank import load_memory, save_memory, add_issue
 import jira_store
 import jira_reports
@@ -60,11 +66,11 @@ def _format_seconds(seconds: int) -> str:
 @mcp.tool()
 def smart_log(instruction: str, project: Optional[str] = None) -> str:
     """
-    Log work, query tasks, or get details using natural language.
+    Log work, query tasks, get details, or fetch Notion worklogs using natural language.
     
     Args:
-        instruction: Natural language instruction (e.g. "2h on GBI-123", "my tasks", "details GBI-123")
-        project: Optional project code (e.g. "DF", "GBI") for logging work.
+        instruction: Natural language instruction (e.g. "2h on GBI-123", "my tasks", "show notion worklogs this week")
+        project: Optional project code (e.g. "DF", "GBI") for logging work or Notion filters.
     """
     
     # Use default project from env if not specified
@@ -266,6 +272,29 @@ def smart_log(instruction: str, project: Optional[str] = None) -> str:
 
         return OrchestratorResult(success=True, intent=Intent.WORK_SUMMARY, message="\n".join(out))
 
+    def notion_worklogs_handler(plan: dict) -> OrchestratorResult:
+        """Fetch time entries from the Notion worklog database."""
+        query_plan = dict(plan or {})
+        if project and not query_plan.get("project"):
+            query_plan["project"] = project
+        kwargs = build_query_kwargs(query_plan)
+        try:
+            result = query_worklogs(**kwargs, quiet=True)
+        except NotionAuthError as e:
+            return OrchestratorResult(
+                success=False,
+                intent=Intent.NOTION_WORKLOGS,
+                message=f"Notion Auth Error: {e}. Run 'smart-log notion-login' in terminal to re-authenticate.",
+            )
+        except NotionWorklogError as e:
+            return OrchestratorResult(success=False, intent=Intent.NOTION_WORKLOGS, message=str(e))
+
+        return OrchestratorResult(
+            success=True,
+            intent=Intent.NOTION_WORKLOGS,
+            message=format_worklogs_markdown(result, max_rows=kwargs.get("limit") or 50),
+        )
+
     # Run orchestrator
     result = orchestrate(
         user_input=instruction,
@@ -273,6 +302,7 @@ def smart_log(instruction: str, project: Optional[str] = None) -> str:
         query_tasks_handler=query_tasks_handler,
         task_detail_handler=task_detail_handler,
         work_summary_handler=work_summary_handler,
+        notion_worklogs_handler=notion_worklogs_handler,
     )
     
     return result.message
@@ -654,6 +684,43 @@ def jira_relationships_local(key: str, depth: int = 1) -> str:
     else:
         lines.append("\n_No links in local cache for this ticket._")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def notion_worklogs_local(
+    users: Optional[List[str]] = None,
+    project: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    period: Optional[str] = None,
+    limit: int = 50,
+) -> str:
+    """
+    Fetch worklog entries from the Notion time-tracking database.
+
+    Reads via Notion's internal queryCollection API using the stored session token.
+    User names must match NOTION_WORKLOG_USERS aliases (defaults to authenticated user).
+
+    Args:
+        users: Filter by display names/aliases (e.g. ["antran", "Thuần Thiên"]).
+        project: Notion project name (NOTION_PROJECT_* mapping, e.g. "Kafi", "DF").
+        since: Include entries on/after YYYY-MM-DD.
+        until: Include entries on/before YYYY-MM-DD.
+        period: Shorthand date window if since/until omitted: today, yesterday,
+            this_week, last_week, this_month, last_month.
+        limit: Maximum rows to return (default 50).
+    """
+    kwargs = build_query_kwargs(
+        {"users": users, "project": project, "since": since, "until": until, "period": period, "limit": limit}
+    )
+    try:
+        result = query_worklogs(**kwargs, quiet=True)
+    except NotionAuthError as e:
+        return f"Notion Auth Error: {e}. Run 'smart-log notion-login' in terminal to re-authenticate."
+    except NotionWorklogError as e:
+        return f"Notion worklog error: {e}"
+
+    return format_worklogs_markdown(result, max_rows=kwargs.get("limit") or 50)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,12 @@ from ai_client import get_ai_client
 
 from notion_form import submit_notion_form, NotionFormError, NotionAuthError
 from notion_auth import get_notion_credentials, clear_token, load_stored_token
-from notion_worklog import query_worklogs, NotionWorklogError
+from notion_worklog import (
+    query_worklogs,
+    NotionWorklogError,
+    build_query_kwargs,
+    period_to_date_range,
+)
 from memory_bank import load_memory, save_memory, add_issue
 from ai_orchestrator import orchestrate, Intent, OrchestratorResult
 
@@ -595,6 +600,41 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
                     console.print(f"    {t['key']}: {_format_time_spent(t['seconds'])} - {tsum}")
 
         return OrchestratorResult(success=True, intent=Intent.WORK_SUMMARY, message=f"Total: {total_hours:.1f} hours")
+
+    def notion_worklogs_handler(plan: dict) -> OrchestratorResult:
+        """Handle notion_worklogs intent — reads from Notion queryCollection API."""
+        kwargs = build_query_kwargs(plan)
+        if plan.get("period") and not plan.get("since") and not plan.get("until"):
+            _, _, period_label = period_to_date_range(plan.get("period"))
+            console.print(f"[dim]Fetching Notion worklogs ({period_label})...[/dim]")
+        else:
+            console.print("[dim]Fetching Notion worklogs...[/dim]")
+
+        try:
+            result = query_worklogs(**kwargs, quiet=True)
+        except NotionAuthError as e:
+            return OrchestratorResult(
+                success=False,
+                intent=Intent.NOTION_WORKLOGS,
+                message=f"Notion Auth Error: {e}. Run 'smart-log notion-login' to re-authenticate.",
+            )
+        except NotionWorklogError as e:
+            return OrchestratorResult(success=False, intent=Intent.NOTION_WORKLOGS, message=str(e))
+
+        if not result["entries"]:
+            return OrchestratorResult(
+                success=True,
+                intent=Intent.NOTION_WORKLOGS,
+                message="No Notion worklog entries found for the given filters.",
+            )
+
+        _display_notion_worklogs(result)
+        total = result.get("total_effort_hours") or 0
+        return OrchestratorResult(
+            success=True,
+            intent=Intent.NOTION_WORKLOGS,
+            message=f"Found {len(result['entries'])} entries, {total:g}h total",
+        )
     
     # Run orchestrator
     result = orchestrate(
@@ -603,6 +643,7 @@ def _smart_handler(input_text: str, project: Optional[str] = None):
         query_tasks_handler=query_tasks_handler,
         task_detail_handler=task_detail_handler,
         work_summary_handler=work_summary_handler,
+        notion_worklogs_handler=notion_worklogs_handler,
     )
     
     # Handle clarify and help intents
@@ -920,6 +961,46 @@ def notion_logout():
     console.print("[green]✔ Logged out from Notion.[/green]")
 
 
+def _display_notion_worklogs(result: dict) -> None:
+    """Render Notion worklog query results as a Rich table."""
+    entries = result.get("entries") or []
+    if not entries:
+        console.print("[yellow]No worklog entries found for the given filters.[/yellow]")
+        return
+
+    table = Table(title="Notion Worklogs", show_lines=True)
+    table.add_column("Created by", style="cyan", no_wrap=True)
+    table.add_column("Project", style="green", no_wrap=True)
+    table.add_column("Date", no_wrap=True)
+    table.add_column("Status", style="magenta")
+    table.add_column("Effort", justify="right", style="yellow")
+    table.add_column("Focus", style="blue")
+    table.add_column("Key deliverables", style="white")
+
+    for row in entries:
+        effort = row.get("effort_hours")
+        effort_str = f"{effort:g}h" if effort is not None else "-"
+        deliverables = row.get("key_deliverables") or "-"
+        if len(deliverables) > 70:
+            deliverables = deliverables[:70] + "..."
+        table.add_row(
+            row.get("created_by") or "-",
+            row.get("project") or "-",
+            row.get("date") or "-",
+            row.get("status") or "-",
+            effort_str,
+            row.get("focus_areas") or "-",
+            deliverables,
+        )
+
+    console.print(table)
+    total = result.get("total_effort_hours") or 0
+    footer = f"[dim]Showing {len(entries)} entries · total effort {total:g}h[/dim]"
+    if result.get("truncated"):
+        footer += " · [yellow]results may be truncated (increase --limit or narrow filters)[/yellow]"
+    console.print(footer)
+
+
 @app.command("notion-worklogs")
 def notion_worklogs_cmd(
     user: Optional[List[str]] = typer.Option(
@@ -973,42 +1054,7 @@ def notion_worklogs_cmd(
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return
 
-    entries = result["entries"]
-    if not entries:
-        console.print("[yellow]No worklog entries found for the given filters.[/yellow]")
-        return
-
-    table = Table(title="Notion Worklogs", show_lines=True)
-    table.add_column("Created by", style="cyan", no_wrap=True)
-    table.add_column("Project", style="green", no_wrap=True)
-    table.add_column("Date", no_wrap=True)
-    table.add_column("Status", style="magenta")
-    table.add_column("Effort", justify="right", style="yellow")
-    table.add_column("Focus", style="blue")
-    table.add_column("Key deliverables", style="white")
-
-    for row in entries:
-        effort = row.get("effort_hours")
-        effort_str = f"{effort:g}h" if effort is not None else "-"
-        deliverables = row.get("key_deliverables") or "-"
-        if len(deliverables) > 70:
-            deliverables = deliverables[:70] + "..."
-        table.add_row(
-            row.get("created_by") or "-",
-            row.get("project") or "-",
-            row.get("date") or "-",
-            row.get("status") or "-",
-            effort_str,
-            row.get("focus_areas") or "-",
-            deliverables,
-        )
-
-    console.print(table)
-    total = result.get("total_effort_hours") or 0
-    footer = f"[dim]Showing {len(entries)} entries · total effort {total:g}h[/dim]"
-    if result.get("truncated"):
-        footer += " · [yellow]results may be truncated (increase --limit or narrow filters)[/yellow]"
-    console.print(footer)
+    _display_notion_worklogs(result)
 
 
 @app.command()

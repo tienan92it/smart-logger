@@ -37,7 +37,8 @@ class Intent(Enum):
     LOG_WORK = "log_work"
     QUERY_TASKS = "query_tasks"
     TASK_DETAIL = "task_detail"
-    WORK_SUMMARY = "work_summary"  # Summary/report of worklogs
+    WORK_SUMMARY = "work_summary"  # Summary/report of Jira worklogs (local cache)
+    NOTION_WORKLOGS = "notion_worklogs"  # Read Notion time-tracking entries
     HELP = "help"
     CLARIFY = "clarify"
 
@@ -79,21 +80,25 @@ Classify into ONE of these intents:
 3. "task_detail" - User wants DETAILS about a SPECIFIC task. Usually mentions a specific issue key with "what is", "details", "info about".
    Extract: issue_key
 
-4. "work_summary" - User wants a SUMMARY or REPORT of their LOGGED WORK/WORKLOGS. Keywords: "summary", "report", "how much did I work", "my work last week", "worklog summary", "time report".
-   Extract: period (e.g., "last_week", "last_month", "this_week", "this_month", "today", "yesterday"), project (optional filter)
+4. "work_summary" - User wants a SUMMARY or REPORT of their JIRA LOGGED WORK (local cache). Keywords: "summary", "report", "how much did I work", "my work last week", "worklog summary", "time report". Do NOT use when Notion is mentioned.
+   Extract: period (e.g., "last_week", "last_month", "this_week", "this_month", "today", "yesterday"), project (optional Jira project key filter)
+
+5. "notion_worklogs" - User wants to READ/VIEW time entries from NOTION (the time-tracking database). MUST mention Notion OR clearly refer to the Notion logtime table (not Jira). Keywords: "notion worklogs", "notion time", "notion logs", "logtime in notion", "who logged on Kafi in notion".
+   Extract: users (list of display names, or null for authenticated user), project (Notion project name like "Kafi" or "DF"), period (same values as work_summary), limit (optional integer, default 50)
    
-5. "help" - User is asking how to use the tool or what it can do.
+6. "help" - User is asking how to use the tool or what it can do.
    Extract: nothing
    
-6. "clarify" - Input is ambiguous or doesn't fit other categories. Need more information.
+7. "clarify" - Input is ambiguous or doesn't fit other categories. Need more information.
    Extract: clarification_message (what to ask the user)
 
 IMPORTANT RULES:
 - If there's a time indicator (2h, 30m, 1 hour, etc.), it's almost always "log_work"
 - "my tasks", "my issues", "show tasks" without time = "query_tasks"
 - Just an issue key with "what is" or "details" = "task_detail"
-- "summary", "report", "my work last week/month" = "work_summary" (NOT query_tasks!)
-- If unsure between query_tasks and log_work, check for time indicator
+- "summary", "report", "my work last week/month" WITHOUT "notion" = "work_summary"
+- Any request to view/read Notion time entries or Notion worklogs = "notion_worklogs"
+- If unsure between work_summary and notion_worklogs, check for "notion"
 
 Return ONLY valid JSON:
 {{"intent": "...", "confidence": 0.0-1.0, "extracted_data": {{...}}, "message": "optional message for clarify/help"}}
@@ -106,6 +111,8 @@ Examples:
 - "summary my work last week" -> {{"intent": "work_summary", "confidence": 0.95, "extracted_data": {{"period": "last_week", "project": null}}, "message": null}}
 - "report my worklogs this month" -> {{"intent": "work_summary", "confidence": 0.95, "extracted_data": {{"period": "this_month", "project": null}}, "message": null}}
 - "how much did I work on GBI last week" -> {{"intent": "work_summary", "confidence": 0.9, "extracted_data": {{"period": "last_week", "project": "GBI"}}, "message": null}}
+- "show my notion worklogs this week" -> {{"intent": "notion_worklogs", "confidence": 0.95, "extracted_data": {{"period": "this_week", "project": null, "users": null, "limit": 50}}, "message": null}}
+- "notion time for antran and Thuần Thiên on Kafi" -> {{"intent": "notion_worklogs", "confidence": 0.95, "extracted_data": {{"period": null, "project": "Kafi", "users": ["antran", "Thuần Thiên"], "limit": 50}}, "message": null}}
 - "help" -> {{"intent": "help", "confidence": 1.0, "extracted_data": {{}}, "message": null}}
 - "GBI-123" -> {{"intent": "clarify", "confidence": 0.5, "extracted_data": {{"issue_key": "GBI-123"}}, "message": "Did you want to log time on GBI-123, see its details, or something else?"}}
 """
@@ -142,6 +149,31 @@ def _fallback_classification(user_input: str) -> ClassificationResult:
             message=None,
         )
     
+    # Check for Notion worklog read patterns (before generic work summary)
+    if "notion" in text and any(
+        kw in text
+        for kw in ("worklog", "logtime", "time log", "time entry", "time entries", "logged", "hours", "effort")
+    ):
+        period = None
+        if "today" in text:
+            period = "today"
+        elif "yesterday" in text:
+            period = "yesterday"
+        elif "this week" in text:
+            period = "this_week"
+        elif "this month" in text:
+            period = "this_month"
+        elif "last month" in text:
+            period = "last_month"
+        elif "last week" in text:
+            period = "last_week"
+        return ClassificationResult(
+            intent=Intent.NOTION_WORKLOGS,
+            confidence=0.75,
+            extracted_data={"period": period, "project": None, "users": None, "limit": 50},
+            message=None,
+        )
+
     # Check for work summary patterns (before query patterns)
     summary_patterns = ["summary", "report", "how much did i work", "my work last", "worklog", "time report"]
     for pattern in summary_patterns:
@@ -374,6 +406,7 @@ def orchestrate(
     query_tasks_handler: Optional[Callable] = None,
     task_detail_handler: Optional[Callable] = None,
     work_summary_handler: Optional[Callable] = None,
+    notion_worklogs_handler: Optional[Callable] = None,
 ) -> OrchestratorResult:
     """
     Main orchestrator entry point.
@@ -389,6 +422,7 @@ def orchestrate(
         query_tasks_handler: Function to call for querying tasks
         task_detail_handler: Function to call for task details
         work_summary_handler: Function to call for work summary/reports
+        notion_worklogs_handler: Function to call for Notion time-entry queries
     """
     # 1. Load memory and build context
     memory = load_memory()
@@ -488,6 +522,23 @@ def orchestrate(
                 intent=classification.intent,
                 message="Work summary handler not configured",
             )
+
+    elif classification.intent == Intent.NOTION_WORKLOGS:
+        if notion_worklogs_handler:
+            try:
+                result = notion_worklogs_handler(classification.extracted_data)
+            except Exception as e:
+                result = OrchestratorResult(
+                    success=False,
+                    intent=classification.intent,
+                    message=f"Failed to query Notion worklogs: {e}",
+                )
+        else:
+            result = OrchestratorResult(
+                success=False,
+                intent=classification.intent,
+                message="Notion worklogs handler not configured",
+            )
     
     elif classification.intent == Intent.HELP:
         result = OrchestratorResult(
@@ -536,14 +587,20 @@ Examples:
     "what is GBI-123"
     "details on KFS-456"
   
-  Work summary:
+  Work summary (Jira local cache):
     "summary my work last week"
     "report my worklogs this month"
     "how much did I work on GBI last week"
 
+  Notion worklogs:
+    "show my notion worklogs this week"
+    "notion time for antran on Kafi"
+    "who logged on Kafi in notion last week"
+
 Commands:
   log         - Explicitly log work (e.g., log "2h on GBI-123")
   tasks       - Explicitly query tasks
+  notion-worklogs - Fetch Notion time entries
   notion-login - Login to Notion
   notion-status - Show Notion status
 """.strip()

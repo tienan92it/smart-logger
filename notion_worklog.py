@@ -525,3 +525,88 @@ def query_worklogs(
         "truncated": has_more or len(block_ids) > len(entries),
         "fetched": len(block_ids),
     }
+
+
+def period_to_date_range(period: Optional[str] = None) -> tuple[Optional[str], Optional[str], str]:
+    """Convert period shorthand to inclusive since/until dates (YYYY-MM-DD)."""
+    from datetime import datetime, timedelta
+
+    period = (period or "").strip().lower() or "last_week"
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    period_label = period.replace("_", " ").title()
+
+    if period == "today":
+        start, end = today, today
+    elif period == "yesterday":
+        start = end = today - timedelta(days=1)
+    elif period == "this_week":
+        start = today - timedelta(days=today.weekday())
+        end = today
+    elif period == "last_week":
+        start = today - timedelta(days=today.weekday() + 7)
+        end = start + timedelta(days=6)
+    elif period == "this_month":
+        start, end = today.replace(day=1), today
+    elif period == "last_month":
+        first = today.replace(day=1)
+        end = first - timedelta(days=1)
+        start = end.replace(day=1)
+    else:
+        start = today - timedelta(days=7)
+        end = today
+        period_label = "Last 7 Days"
+
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), period_label
+
+
+def build_query_kwargs(plan: dict[str, Any]) -> dict[str, Any]:
+    """Map orchestrator/MCP plan fields to `query_worklogs` kwargs."""
+    since = plan.get("since")
+    until = plan.get("until")
+    period = plan.get("period")
+    if not since and not until and period:
+        since, until, _ = period_to_date_range(period)
+
+    users = plan.get("users")
+    if isinstance(users, str):
+        users = [users]
+
+    limit = plan.get("limit")
+    return {
+        "users": users or None,
+        "project": plan.get("project") or None,
+        "limit": int(limit) if limit else 50,
+        "since": since,
+        "until": until,
+    }
+
+
+def format_worklogs_markdown(result: dict[str, Any], max_rows: int = 50) -> str:
+    """Format query result as a Markdown table for MCP / agent output."""
+    entries = result.get("entries") or []
+    if not entries:
+        return "No Notion worklog entries found for the given filters."
+
+    total = result.get("total_effort_hours") or 0
+    lines = [
+        f"**Notion worklogs** — {len(entries)} entries, {total:g}h total",
+        "",
+        "| Created by | Project | Date | Status | Effort | Focus | Key deliverables |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in entries[:max_rows]:
+        effort = row.get("effort_hours")
+        effort_str = f"{effort:g}h" if effort is not None else "-"
+        deliverables = (row.get("key_deliverables") or "-").replace("|", "\\|")
+        if len(deliverables) > 80:
+            deliverables = deliverables[:80] + "..."
+        lines.append(
+            f"| {row.get('created_by') or '-'} | {row.get('project') or '-'} | "
+            f"{row.get('date') or '-'} | {row.get('status') or '-'} | {effort_str} | "
+            f"{row.get('focus_areas') or '-'} | {deliverables} |"
+        )
+    if len(entries) > max_rows:
+        lines.append(f"\n_Showing {max_rows} of {len(entries)} entries._")
+    if result.get("truncated"):
+        lines.append("_Results may be truncated — narrow filters or raise limit._")
+    return "\n".join(lines)
